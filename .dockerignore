@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.egg-info
+dist
+build
+.eggs
+
+# Virtual environments
+.venv
+venv
+ENV
+
+# Environment secrets (never bake into image)
+.env
+.env.local
+
+# IDE / OS
+.idea
+.vscode
+.DS_Store
+
+# Tests & coverage
+tests
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+.ruff_cache
+
+# Docs
+*.md
+LICENSE
+
+# Local data volumes
+minio-data
+esdata
+logs
+
+# Keep init-db SQL scripts (intentionally NOT ignored)
+# agent-postgres runtime data is in a Docker volume, not here
+
+# CI artifacts
+*.log

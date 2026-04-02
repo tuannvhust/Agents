@@ -1,0 +1,290 @@
+# Shared network
+networks:
+  agent-net:
+    driver: bridge
+  # Join the external network where pgAdmin lives so it can reach agent-postgres
+  common-net:
+    external: true
+
+# Persistent volumes
+volumes:
+  minio-data:
+  esdata:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  langfuse-clickhouse-logs:
+  langfuse-redis-data:
+  agent-postgres-data:        # dedicated volume for the agent database
+
+services:
+  # ── Agent System API ──────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: agent-system
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8000"
+    env_file:
+      - .env
+    environment:
+      # Override service URLs to use internal Docker hostnames
+      MINIO_ENDPOINT: minio:9000
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      LANGFUSE_HOST: http://langfuse-web
+      LANGFUSE_PORT: 3000
+      AGENT_POSTGRES_URL: postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agentdb}
+      # MCP server list — agent-postgres is reachable via Docker network hostname.
+      # The JSON is set here (not in .env) so the internal hostname is used.
+      # Add more MCP servers by appending to the array.
+      MCP_SERVERS: >-
+        [
+          {
+            "name": "postgres",
+            "command": "npx",
+            "args": [
+              "--yes",
+              "@modelcontextprotocol/server-postgres",
+              "postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agentdb}"
+            ]
+          }
+        ]
+    depends_on:
+      minio:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      agent-postgres:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_started
+    networks:
+      - agent-net
+    volumes:
+      - ./skills:/app/skills:ro
+
+  # ── Agent PostgreSQL ───────────────────────────────────────────────────────
+  # Separate from Langfuse's postgres — used by agents via the MCP postgres
+  # server. Agents can create tables, store results, run arbitrary SQL queries.
+  agent-postgres:
+    image: postgres:16-alpine
+    container_name: agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AGENT_POSTGRES_USER:-agent}
+      POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD:-agent}
+      POSTGRES_DB: ${AGENT_POSTGRES_DB:-agentdb}
+    ports:
+      - "${AGENT_POSTGRES_PORT:-5433}:5432"   # 5433 on host → 5432 inside container
+    volumes:
+      - agent-postgres-data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro   # optional init SQL scripts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AGENT_POSTGRES_USER:-agent} -d ${AGENT_POSTGRES_DB:-agentdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-net
+      - common-net   # also join pgAdmin's network for direct container-to-container access
+
+  # ── MinIO Object Storage ───────────────────────────────────────────────────
+  # Pre-creates both the agent bucket and the langfuse bucket on every start.
+  minio:
+    image: minio/minio:latest
+    container_name: agent-minio
+    restart: unless-stopped
+    entrypoint: sh
+    command: >-
+      -c 'mkdir -p /data/${MINIO_BUCKET:-agent-files} /data/langfuse
+      && minio server /data --console-address ":9001"'
+    ports:
+      - "${MINIO_HOST_PORT:-9100}:9000"
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"  # MinIO console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-net
+
+  # ── ElasticSearch ─────────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+    container_name: agent-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    networks:
+      - agent-net
+
+  # ── Kibana (ElasticSearch UI) ──────────────────────────────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.0
+    container_name: agent-kibana
+    restart: unless-stopped
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - agent-net
+
+  # ── Langfuse v3 (Prompt Management + Observability) ───────────────────────
+  # v3 architecture: web + worker + ClickHouse + Redis + Postgres
+  langfuse-postgres:
+    image: postgres:16-alpine
+    container_name: agent-langfuse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-net
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: agent-langfuse-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - agent-net
+
+  langfuse-redis:
+    image: redis:7-alpine
+    container_name: agent-langfuse-redis
+    restart: unless-stopped
+    command: --requirepass langfuse-redis-secret --maxmemory-policy noeviction
+    volumes:
+      - langfuse-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "langfuse-redis-secret", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+    networks:
+      - agent-net
+
+  # Shared environment anchored here and merged into both web and worker
+  langfuse-web:
+    image: langfuse/langfuse:3
+    container_name: agent-langfuse
+    restart: unless-stopped
+    ports:
+      - "${LANGFUSE_HOST_PORT:-3001}:3000"
+    environment: &langfuse-env
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      NEXTAUTH_SECRET: changeme-secret-32-chars-minimum!!
+      NEXTAUTH_URL: http://localhost:${LANGFUSE_HOST_PORT:-3001}
+      SALT: changeme-salt
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      TELEMETRY_ENABLED: "false"
+      # ClickHouse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:clickhouse@langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      # Redis
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: langfuse-redis-secret
+      REDIS_TLS_ENABLED: "false"
+      # S3 / MinIO (reuse agent MinIO, separate bucket)
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_EXTERNAL_ENDPOINT: http://localhost:${MINIO_HOST_PORT:-9100}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+      # Auto-provision org + project + user + API keys on first boot.
+      # Keys match what is already set in .env so no manual UI step is needed.
+      LANGFUSE_INIT_ORG_ID: default-org
+      LANGFUSE_INIT_ORG_NAME: "Default Org"
+      LANGFUSE_INIT_PROJECT_ID: default-project
+      LANGFUSE_INIT_PROJECT_NAME: "Agent System"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-placeholder}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-placeholder}
+      LANGFUSE_INIT_USER_EMAIL: admin@example.com
+      LANGFUSE_INIT_USER_NAME: Admin
+      LANGFUSE_INIT_USER_PASSWORD: Admin1234!
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - agent-net
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: agent-langfuse-worker
+    restart: unless-stopped
+    environment:
+      <<: *langfuse-env
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - agent-net

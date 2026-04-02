@@ -1,0 +1,7 @@
+{
+  "eval_set_id": "coder_proxy",
+  "name": "Coder Proxy Regression Set",
+  "description": "Baseline sessions captured from ADK Web for coder_proxy.",
+  "eval_cases": []
+}
+

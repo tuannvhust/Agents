@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+logs/
+*.log
+
+# Docker
+docker-compose.override.yml
+
+# MinIO data (local dev)
+minio-data/
+
+# ElasticSearch data (local dev)
+esdata/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Secrets
+*.pem
+*.key
+*.crt
