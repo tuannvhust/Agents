@@ -56,6 +56,9 @@ minio-data/
 # ElasticSearch data (local dev)
 esdata/
 
+# ADK local session DBs (do not commit)
+**/.adk/*.db
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
