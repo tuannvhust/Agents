@@ -11,10 +11,12 @@ from agent_system.api.security import require_api_key
 from agent_system.api.schemas import (
     AgentConfigRequest,
     AgentListResponse,
+    AgentResumeRequest,
     AgentRunRequest,
     AgentRunResponse,
     AgentSummary,
 )
+from agent_system.core.interrupt_registry import get_pending
 from agent_system.core.agent import Agent, AgentConfig
 
 router = APIRouter(
@@ -67,6 +69,10 @@ async def create_agent(
         temperature=payload.temperature,
         max_reflections=payload.max_reflections,
         tools=[t for t in payload.tools if t != "string"],  # strip swagger placeholder
+        tools_requiring_approval=[
+            t for t in (payload.tools_requiring_approval or []) if t != "string"
+        ],
+        plugins=list(payload.plugins or []),
         extra_metadata=payload.extra_metadata,
     )
 
@@ -147,6 +153,62 @@ async def run_agent(
         messages_count=result.messages_count,
         stored_artifacts=result.stored_artifacts,
         error=result.error,
+        run_status=result.run_status,
+        approval_request=result.approval_request,
+        trace=result.trace if payload.include_trace else None,
+    )
+
+
+@router.post(
+    "/{name}/runs/{run_id}/resume",
+    response_model=AgentRunResponse,
+    summary="Resume a run paused for human tool approval",
+)
+async def resume_agent_run(
+    name: str,
+    run_id: str,
+    payload: AgentResumeRequest,
+    cache: Annotated[dict[str, Agent], Depends(get_cache)],
+) -> AgentRunResponse:
+    """Continue execution after the operator approves or rejects the planned tool batch."""
+    agent = _get_or_404(name, cache)
+    pending = get_pending(run_id)
+    if pending is None or pending.agent_name != name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No pending tool approval for run_id '{run_id}' on agent '{name}'.",
+        )
+    if payload.action == "reject" and not (payload.reason or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide a non-empty 'reason' when action is 'reject'.",
+        )
+    decision: dict = (
+        {"action": "approve"}
+        if payload.action == "approve"
+        else {"action": "reject", "reason": (payload.reason or "").strip()}
+    )
+    try:
+        result = await agent.resume_run(run_id=run_id, decision=decision)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    return AgentRunResponse(
+        agent_name=result.agent_name,
+        run_id=result.run_id,
+        task=result.task,
+        final_answer=result.final_answer,
+        success=result.success,
+        reflection_count=result.reflection_count,
+        messages_count=result.messages_count,
+        stored_artifacts=result.stored_artifacts,
+        error=result.error,
+        run_status=result.run_status,
+        approval_request=result.approval_request,
+        trace=None,
     )
 
 
@@ -179,6 +241,8 @@ def _agent_to_summary(agent: Agent) -> AgentSummary:
         model=agent.config.model,
         model_source=agent.config.model_source,
         tools=agent.config.tools,
+        tools_requiring_approval=list(agent.config.tools_requiring_approval or []),
+        plugins=list(agent.config.plugins or []),
     )
 
 
@@ -191,5 +255,7 @@ def _config_to_dict(config: AgentConfig) -> dict:
         "temperature": config.temperature,
         "max_reflections": config.max_reflections,
         "tools": config.tools,
+        "tools_requiring_approval": list(config.tools_requiring_approval or []),
+        "plugins": list(config.plugins or []),
         "extra_metadata": config.extra_metadata,
     }

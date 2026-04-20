@@ -31,6 +31,22 @@ class AgentConfigRequest(BaseModel):
         default_factory=list,
         description="Tool names to enable. Empty list = all registered tools.",
     )
+    tools_requiring_approval: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tool names that pause the run for human approval before execution "
+            "(Reviewer UI + POST .../resume). If any planned call matches, the whole batch waits."
+        ),
+    )
+    plugins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Plugin names to activate for this agent. "
+            "Currently supported: 'safety' (prompt-injection classifier that runs "
+            "before every LLM call). Leave empty to disable all plugins."
+        ),
+        examples=[["safety"]],
+    )
     extra_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -41,6 +57,10 @@ class AgentRunRequest(BaseModel):
     session_id: str | None = Field(
         None,
         description="Optional session/run ID for traceability. Auto-generated if omitted.",
+    )
+    include_trace: bool = Field(
+        False,
+        description="If true, include the full structured run trace in the response (can be large).",
     )
 
 
@@ -56,6 +76,33 @@ class AgentRunResponse(BaseModel):
     messages_count: int
     stored_artifacts: list[str] = Field(default_factory=list)
     error: str | None = None
+    run_status: Literal["completed", "awaiting_approval"] = Field(
+        "completed",
+        description="awaiting_approval when the run stopped for human tool approval.",
+    )
+    approval_request: dict[str, Any] | None = Field(
+        None,
+        description="Payload for the Reviewer UI (planned tools, args, message digest). "
+        "Set when run_status is awaiting_approval.",
+    )
+    trace: dict[str, Any] | None = Field(
+        None,
+        description="Structured trace (plan text, tool choices, exact args, reflection). "
+        "Present when include_trace was true on the request.",
+    )
+
+
+class AgentResumeRequest(BaseModel):
+    """Operator decision to resume a paused run."""
+
+    action: Literal["approve", "reject"] = Field(
+        ...,
+        description="approve executes planned tools; reject sends rejection tool messages to the agent.",
+    )
+    reason: str | None = Field(
+        None,
+        description="Required context when action is reject (shown to the agent).",
+    )
 
 
 class AgentSummary(BaseModel):
@@ -64,6 +111,8 @@ class AgentSummary(BaseModel):
     model: str | None
     model_source: str
     tools: list[str]
+    tools_requiring_approval: list[str] = Field(default_factory=list)
+    plugins: list[str] = Field(default_factory=list)
 
 
 class AgentListResponse(BaseModel):

@@ -18,7 +18,9 @@ def main() -> None:
         port=cfg.app.port,
         reload=cfg.app.debug,
         log_level=cfg.app.log_level.lower(),
-        workers=1 if cfg.app.debug else 2,
+        # Single process: pending-approval registry and agent cache are in-memory.
+        # Use workers>1 only behind a shared store + sticky routing (not supported here).
+        workers=1,
     )
 
 

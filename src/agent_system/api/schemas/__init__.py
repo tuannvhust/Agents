@@ -1,5 +1,6 @@
 from .agent_schemas import (
     AgentConfigRequest,
+    AgentResumeRequest,
     AgentRunRequest,
     AgentRunResponse,
     AgentListResponse,
@@ -9,6 +10,7 @@ from .agent_schemas import (
 
 __all__ = [
     "AgentConfigRequest",
+    "AgentResumeRequest",
     "AgentRunRequest",
     "AgentRunResponse",
     "AgentListResponse",

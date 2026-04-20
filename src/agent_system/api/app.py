@@ -38,11 +38,41 @@ def get_config_store():
     return _config_store
 
 
+def _cache_redis_active(cfg) -> bool:
+    return cfg.cache_enabled and cfg.cache_type.lower().strip() == "redis"
+
+
 def get_run_store():
     global _run_store
     if _run_store is None:
+        from agent_system.storage.caching_run_store import CachingRunStore
         from agent_system.storage.run_store import RunStore
-        _run_store = RunStore()
+
+        cfg = get_settings()
+        inner = RunStore()
+        if _cache_redis_active(cfg):
+            from agent_system.cache.redis_client import get_redis
+
+            _run_store = CachingRunStore(
+                inner,
+                get_redis(),
+                memory_ttl_seconds=cfg.cache_memory_ttl_seconds,
+                conversation_ttl_seconds=cfg.cache_conversation_ttl_seconds,
+                tool_messages_ttl_seconds=cfg.cache_tool_messages_ttl_seconds,
+            )
+            logger.info(
+                "RunStore: Redis cache-aside enabled (memory TTL=%ds, run TTL=%ds, tool_calls TTL=%ds)",
+                cfg.cache_memory_ttl_seconds,
+                cfg.cache_conversation_ttl_seconds,
+                cfg.cache_tool_messages_ttl_seconds,
+            )
+        else:
+            _run_store = inner
+            if cfg.cache_enabled:
+                logger.warning(
+                    "CACHE_ENABLED=true but CACHE_TYPE=%r is not supported; using Postgres only.",
+                    cfg.cache_type,
+                )
     return _run_store
 
 
@@ -60,8 +90,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from agent_system.database import close_pool, init_pool
     await init_pool(cfg.agent_postgres_url)
 
+    if _cache_redis_active(cfg):
+        from agent_system.cache.redis_client import init_redis
+
+        logger.info("Connecting Redis cache at startup (CACHE_ENABLED=true, CACHE_TYPE=redis).")
+        await init_redis(cfg.cache_redis_url)
+    elif cfg.cache_enabled:
+        logger.warning(
+            "CACHE_ENABLED=true but CACHE_TYPE=%r is not 'redis'; skipping Redis startup.",
+            cfg.cache_type,
+        )
+
     # Ensure agent_configs table exists (idempotent — harmless on every start)
     await _ensure_agent_configs_table()
+
+    # Older agent-postgres volumes may lack run_trace; app code expects it (see init-db/02_run_trace_column.sql)
+    await _ensure_agent_runs_run_trace_column()
 
     # ── Built-in tools + MCP tools ────────────────────────────────────────────
     registry = get_tool_registry()
@@ -80,6 +124,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("Agent System shutting down.")
+    if _cache_redis_active(cfg):
+        from agent_system.cache.redis_client import close_redis
+
+        await close_redis()
     await close_pool()
 
 
@@ -99,6 +147,22 @@ async def _ensure_agent_configs_table() -> None:
         logger.debug("agent_configs table ensured.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not ensure agent_configs table: %s", exc)
+
+
+async def _ensure_agent_runs_run_trace_column() -> None:
+    """Add run_trace to agent_runs if missing (existing DBs created before the column existed)."""
+    from agent_system.database import get_pool
+    try:
+        async with get_pool().acquire() as conn:
+            await conn.execute(
+                """
+                ALTER TABLE agent_runs
+                    ADD COLUMN IF NOT EXISTS run_trace JSONB NOT NULL DEFAULT '{}'::jsonb
+                """
+            )
+        logger.debug("agent_runs.run_trace column ensured.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not ensure agent_runs.run_trace column: %s", exc)
 
 
 async def _restore_agents_from_db() -> None:
@@ -126,6 +190,8 @@ async def _restore_agents_from_db() -> None:
                 temperature=cfg_dict.get("temperature", 0.0),
                 max_reflections=cfg_dict.get("max_reflections", 3),
                 tools=cfg_dict.get("tools", []),
+                tools_requiring_approval=cfg_dict.get("tools_requiring_approval", []),
+                plugins=cfg_dict.get("plugins", []),
                 extra_metadata=cfg_dict.get("extra_metadata", {}),
             )
             agent = await Agent.create(config, tool_registry=registry)
@@ -178,10 +244,17 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ───────────────────────────────────────────────────────────────
-    from agent_system.api.routes import agents_router, debug_router, files_router, health_router
+    from agent_system.api.routes import (
+        agents_router,
+        debug_router,
+        files_router,
+        health_router,
+        review_router,
+    )
 
     app.include_router(health_router)
     app.include_router(agents_router)
+    app.include_router(review_router)
     app.include_router(debug_router)
     app.include_router(files_router)
 

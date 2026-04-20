@@ -15,6 +15,7 @@ volumes:
   langfuse-clickhouse-logs:
   langfuse-redis-data:
   agent-postgres-data:        # dedicated volume for the agent database
+  agent-redis-cache-data:     # optional Redis for API repository cache (CACHE_ENABLED=true)
 
 services:
   # ── Agent System API ──────────────────────────────────────────────────────
@@ -25,6 +26,9 @@ services:
       target: runtime
     container_name: agent-system
     restart: unless-stopped
+    # Lets OCR_URL use host.docker.internal to reach services on the host (e.g. OCR on :9999).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${APP_PORT:-8080}:8000"
     env_file:
@@ -51,6 +55,8 @@ services:
             ]
           }
         ]
+      # Repository cache (see .env CACHE_*). URL uses Docker service name when cache is enabled.
+      CACHE_REDIS_URL: redis://agent-redis:6379/0
     depends_on:
       minio:
         condition: service_healthy
@@ -58,12 +64,19 @@ services:
         condition: service_healthy
       agent-postgres:
         condition: service_healthy
+      # Required when CACHE_ENABLED=true: same compose network as CACHE_REDIS_URL=redis://agent-redis:6379/0
+      agent-redis:
+        condition: service_healthy
       langfuse-web:
         condition: service_started
     networks:
       - agent-net
     volumes:
       - ./skills:/app/skills:ro
+      - ./guardrails:/app/guardrails:ro
+      # Drop PDFs here on the host; inside the container use paths like /ocr_input/your.pdf
+      # for ocr_document (host paths such as /Users/... are NOT visible in the container).
+      - ./ocr_input:/ocr_input:ro
 
   # ── Agent PostgreSQL ───────────────────────────────────────────────────────
   # Separate from Langfuse's postgres — used by agents via the MCP postgres
@@ -112,6 +125,76 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 15s
       timeout: 5s
+      retries: 5
+    networks:
+      - agent-net
+
+  # ── Chainlit Chat UI ──────────────────────────────────────────────────────
+  # Talks to the same Postgres and tools as the FastAPI backend.
+  # Start with: docker compose up chat
+  chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: chat          # uses builder-chat stage → chainlit is installed
+    container_name: agent-chat
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${CHAT_PORT:-8501}:8501"
+    env_file:
+      - .env
+    environment:
+      AGENT_POSTGRES_URL: postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agentdb}
+      MINIO_ENDPOINT: minio:9000
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      LANGFUSE_HOST: http://langfuse-web
+      LANGFUSE_PORT: 3000
+      CACHE_REDIS_URL: redis://agent-redis:6379/0
+      MCP_SERVERS: >-
+        [
+          {
+            "name": "postgres",
+            "command": "npx",
+            "args": [
+              "--yes",
+              "@modelcontextprotocol/server-postgres",
+              "postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agentdb}"
+            ]
+          }
+        ]
+    depends_on:
+      agent-postgres:
+        condition: service_healthy
+      agent-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - agent-net
+    volumes:
+      - ./skills:/app/skills:ro
+      - ./guardrails:/app/guardrails:ro
+      - ./ocr_input:/ocr_input:ro
+      - ./src/agent_system/chat/chainlit.md:/app/chainlit.md:ro
+      - ./src/agent_system/chat/.chainlit:/app/.chainlit
+
+  # ── Redis (optional API repository cache) ──────────────────────────────────
+  # Langfuse uses its own Redis (langfuse-redis). This instance is for CACHE_ENABLED=true only.
+  agent-redis:
+    image: redis:7-alpine
+    container_name: agent-cache-redis
+    restart: unless-stopped
+    ports:
+      - "${AGENT_REDIS_PORT:-6380}:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - agent-redis-cache-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 5
     networks:
       - agent-net

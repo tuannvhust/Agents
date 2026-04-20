@@ -1,0 +1,3 @@
+# Ignore uploaded test files; keep this directory in git for Docker bind mount.
+*
+!.gitignore

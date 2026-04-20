@@ -60,7 +60,6 @@ async def health() -> HealthResponse:
     pg_url = _build_postgres_url(cfg)
     if pg_url:
         try:
-            import asyncio
             import socket
 
             host, port = _parse_pg_host_port(pg_url)
@@ -72,6 +71,22 @@ async def health() -> HealthResponse:
             logger.warning("PostgreSQL health check failed: %s", exc)
     else:
         services["postgres"] = "not configured"
+
+    # Redis (repository cache) — only when CACHE_ENABLED + CACHE_TYPE=redis
+    if cfg.cache_enabled and cfg.cache_type.lower().strip() == "redis":
+        try:
+            from agent_system.cache.redis_client import get_redis
+
+            r = get_redis()
+            pong = await r.ping()
+            services["redis_cache"] = "ok" if pong else "error: unexpected PING reply"
+        except Exception as exc:  # noqa: BLE001
+            services["redis_cache"] = f"error: {exc}"
+            logger.warning("Redis cache health check failed: %s", exc)
+    elif cfg.cache_enabled:
+        services["redis_cache"] = f"skipped (CACHE_TYPE={cfg.cache_type!r})"
+    else:
+        services["redis_cache"] = "disabled (CACHE_ENABLED=false)"
 
     # MCP servers — just report which are configured
     mcp_servers = cfg.mcp_servers

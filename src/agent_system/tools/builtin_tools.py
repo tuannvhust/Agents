@@ -4,23 +4,30 @@ Tools provided:
   - web_search       — DuckDuckGo web search (no API key required)
   - calculate        — Safe arithmetic / math expression evaluator
   - fetch_url        — HTTP GET a URL and return its text content
-  - read_file        — Read a file from MinIO (or local path as fallback)
-  - write_file       — Write text content to MinIO
-  - create_word_file — Create a .docx file and save to MinIO
-  - list_files       — List files in MinIO under an optional prefix
+  - read_file        — Read from MinIO (paths are run-scoped: runs/{agent}/{run_id}/… when enabled)
+  - write_file       — Write text to MinIO (same run-scoped layout)
+  - create_word_file — Create a .docx in MinIO (same)
+  - list_files       — List objects under the current run workspace (or global if no active run)
   - get_datetime     — Return the current UTC date and time
   - summarise_text   — Truncate long text to a readable excerpt
+  - ocr_document      — Submit a local file to the OCR gateway, poll until done, return result JSON
+  - ocr_minio_document — Download a file from MinIO (run-scoped path), then OCR like ocr_document
+  - ocr_get_job       — Single GET for an OCR job by job_ckey (status or result)
 """
 
 from __future__ import annotations
 
 import ast
 import io
+import json
 import logging
 import math
+import mimetypes
 import operator
 import re
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -170,6 +177,216 @@ def fetch_url(url: str, timeout: int = 15) -> str:
         return f"Request error: {exc}"
 
 
+# ── OCR gateway (HTTP, env: OCR_URL, OCR_API_KEY) ─────────────────────────────
+
+
+def _ocr_gateway_config():
+    from agent_system.config import get_settings
+
+    return get_settings().ocr_gateway
+
+
+def _ocr_headers(api_key: str) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["X-API-KEY"] = api_key
+    return headers
+
+
+def _ocr_status_url(submit_url: str, job_ckey: str) -> str:
+    return f"{submit_url.rstrip('/')}/{job_ckey}"
+
+
+def _ocr_format_result_payload(data: dict[str, Any]) -> str:
+    """Return the API `result` field as pretty JSON (the object under top-level ``result``)."""
+    payload = data.get("result")
+    if payload is None:
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+# Max object size to load from MinIO into memory for OCR (bytes)
+_OCR_MINIO_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _ocr_normalized_poll_params(
+    cfg: Any,
+    poll_interval_seconds: float | None,
+    max_wait_seconds: float | None,
+) -> tuple[float, float]:
+    interval = (
+        float(poll_interval_seconds)
+        if poll_interval_seconds is not None
+        else float(cfg.poll_interval)
+    )
+    max_wait = (
+        float(max_wait_seconds)
+        if max_wait_seconds is not None
+        else float(cfg.max_wait_seconds)
+    )
+    interval = max(0.5, min(interval, 120.0))
+    max_wait = max(interval, min(max_wait, 86_400.0))
+    return interval, max_wait
+
+
+def _ocr_post_multipart_and_poll(
+    cfg: Any,
+    file_name: str,
+    file_bytes: bytes,
+    content_type: str,
+    doc_type: str,
+    interval: float,
+    max_wait: float,
+) -> str:
+    """POST multipart job then poll until terminal state. Shared by local-path and MinIO OCR tools."""
+    headers = _ocr_headers(cfg.api_key)
+    try:
+        with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+            stream = io.BytesIO(file_bytes)
+            files = {"file": (file_name, stream, content_type)}
+            data = {"doc_type": doc_type}
+            post_resp = client.post(cfg.url, headers=headers, files=files, data=data)
+            post_resp.raise_for_status()
+            try:
+                body = post_resp.json()
+            except json.JSONDecodeError:
+                return f"OCR submit returned non-JSON: {post_resp.text[:500]}"
+            job_ckey = body.get("job_ckey")
+            if not job_ckey:
+                return f"OCR submit missing job_ckey: {body}"
+            status_url = _ocr_status_url(cfg.url, str(job_ckey))
+
+            elapsed = 0.0
+            snap: dict[str, Any] = {}
+            while elapsed <= max_wait:
+                get_resp = client.get(status_url, headers=headers)
+                get_resp.raise_for_status()
+                try:
+                    snap = get_resp.json()
+                except json.JSONDecodeError:
+                    return f"OCR status returned non-JSON: {get_resp.text[:500]}"
+                st = str(snap.get("status", "")).upper()
+                if st == "COMPLETED":
+                    return _ocr_format_result_payload(snap)
+                if st in ("FAILED", "ERROR", "CANCELLED"):
+                    return (
+                        f"OCR job failed (status={st}). "
+                        f"job_ckey={job_ckey}. Response: "
+                        f"{json.dumps(snap, ensure_ascii=False)[:4000]}"
+                    )
+                time.sleep(interval)
+                elapsed += interval
+
+            return (
+                f"OCR job timed out after {max_wait}s (job_ckey={job_ckey}). "
+                f"Last status: {snap.get('status', '')!r}. "
+                f"Call ocr_get_job with this job_ckey to check again."
+            )
+    except httpx.HTTPStatusError as exc:
+        return f"OCR HTTP error {exc.response.status_code}: {exc.response.text[:800]}"
+    except httpx.RequestError as exc:
+        return f"OCR request error: {exc}"
+
+
+@tool
+def ocr_document(
+    file_path: str,
+    doc_type: str,
+    poll_interval_seconds: float | None = None,
+    max_wait_seconds: float | None = None,
+) -> str:
+    """Run OCR on a local file via the configured OCR gateway.
+
+    Submits a multipart job (doc_type + file), then polls GET until the job
+    completes or fails. Returns the JSON under the response field ``result``
+    (the structured OCR output), or an error message.
+
+    Configure ``OCR_URL`` (e.g. http://host:9999/api/v1/job) and ``OCR_API_KEY``
+    in the environment. Optional defaults: ``OCR_POLL_INTERVAL``,
+    ``OCR_MAX_WAIT_SECONDS``.
+
+    Args:
+        file_path: Absolute or relative path to a PDF or other supported file on
+            the machine where the API runs (same host as the agent process unless
+            paths are shared into the container).
+        doc_type: Document type slug expected by the gateway (e.g. gdnct_khcn_ttqt).
+        poll_interval_seconds: Seconds between status polls (default from OCR_POLL_INTERVAL or 5).
+        max_wait_seconds: Give up after this many seconds (default from OCR_MAX_WAIT_SECONDS or 600).
+
+    Returns:
+        Pretty-printed JSON of the gateway's ``result`` field, or an error string.
+    """
+    cfg = _ocr_gateway_config()
+    if not (cfg.url or "").strip():
+        return (
+            "OCR is not configured: set OCR_URL (and usually OCR_API_KEY) in the environment."
+        )
+    path = Path(file_path).expanduser()
+    try:
+        path = path.resolve()
+    except OSError as exc:
+        return f"Error resolving path: {exc}"
+    if not path.is_file():
+        return f"Error: file not found or not a file: {path}"
+
+    interval, max_wait = _ocr_normalized_poll_params(
+        cfg, poll_interval_seconds, max_wait_seconds
+    )
+    mime, _ = mimetypes.guess_type(str(path))
+    content_type = mime or "application/octet-stream"
+    try:
+        file_bytes = path.read_bytes()
+    except OSError as exc:
+        return f"OCR file read error: {exc}"
+    return _ocr_post_multipart_and_poll(
+        cfg, path.name, file_bytes, content_type, doc_type, interval, max_wait
+    )
+
+
+@tool
+def ocr_get_job(job_ckey: str) -> str:
+    """Fetch one OCR job snapshot from the gateway (no upload).
+
+    Use when you already have a ``job_ckey`` (e.g. after a timeout from
+    ocr_document) or to poll manually.
+
+    Args:
+        job_ckey: The job identifier returned by the gateway on submit.
+
+    Returns:
+        If status is COMPLETED, the pretty-printed JSON of the ``result`` field;
+        otherwise a short status summary and the raw JSON (truncated if huge).
+    """
+    cfg = _ocr_gateway_config()
+    if not (cfg.url or "").strip():
+        return (
+            "OCR is not configured: set OCR_URL (and usually OCR_API_KEY) in the environment."
+        )
+    if not job_ckey.strip():
+        return "Error: job_ckey is empty."
+    status_url = _ocr_status_url(cfg.url, job_ckey.strip())
+    headers = _ocr_headers(cfg.api_key)
+    try:
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            resp = client.get(status_url, headers=headers)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                return f"OCR status returned non-JSON: {resp.text[:500]}"
+            st = str(data.get("status", "")).upper()
+            if st == "COMPLETED":
+                return _ocr_format_result_payload(data)
+            blob = json.dumps(data, ensure_ascii=False, indent=2)
+            if len(blob) > 8000:
+                blob = blob[:8000] + "\n\n[... truncated]"
+            return f"Status: {data.get('status', '')!r}\n{blob}"
+    except httpx.HTTPStatusError as exc:
+        return f"OCR HTTP error {exc.response.status_code}: {exc.response.text[:800]}"
+    except httpx.RequestError as exc:
+        return f"OCR request error: {exc}"
+
+
 # ── File I/O (MinIO-backed) ───────────────────────────────────────────────────
 
 def _get_minio():
@@ -182,28 +399,125 @@ def _get_minio():
         return None
 
 
+def _run_scoped_minio_prefix() -> str | None:
+    """Return workspace prefix when session scoping is on and tools run inside a graph."""
+    from agent_system.core.run_context import get_run_context
+    from agent_system.storage.session_paths import run_workspace_prefix
+
+    ctx = get_run_context()
+    if ctx is None:
+        return None
+    return run_workspace_prefix(ctx.agent_name, ctx.run_id)
+
+
+def _logical_path_display(user_path: str) -> str:
+    """Normalize path as the agent typed it (no leading slash)."""
+    return user_path.strip().lstrip("/")
+
+
+def _resolve_minio_key(user_path: str) -> str:
+    """Map a tool path to the object key in MinIO (session-prefixed when applicable)."""
+    p = _logical_path_display(user_path)
+    base = _run_scoped_minio_prefix()
+    if not base:
+        return p
+    if p.startswith(base):
+        return p
+    # Explicit bucket-style key (other run, shared asset, or legacy flat key)
+    if p.startswith("runs/"):
+        return p
+    return base + p
+
+
+def _logical_key_for_display(full_key: str) -> str:
+    """Strip session prefix from listing results so the model sees run-relative paths."""
+    base = _run_scoped_minio_prefix()
+    if base and full_key.startswith(base):
+        return full_key[len(base) :]
+    return full_key
+
+
+@tool
+def ocr_minio_document(
+    path: str,
+    doc_type: str,
+    poll_interval_seconds: float | None = None,
+    max_wait_seconds: float | None = None,
+) -> str:
+    """Download a file from MinIO and run OCR via the same gateway as ``ocr_document``.
+
+    The ``path`` follows the same rules as ``read_file``: run-relative under
+    ``runs/{agent}/{run_id}/`` when session scoping is enabled, or a full key
+    starting with ``runs/``.
+
+    Uses ``OCR_URL``, ``OCR_API_KEY``, and optional ``OCR_POLL_INTERVAL`` /
+    ``OCR_MAX_WAIT_SECONDS``. Objects larger than 100 MiB are rejected to limit
+    memory use.
+
+    Args:
+        path: MinIO object path (e.g. "uploads/doc.pdf" in the current run workspace).
+        doc_type: Document type slug for the gateway (e.g. gdnct_khcn_ttqt).
+        poll_interval_seconds: Seconds between status polls (default from env).
+        max_wait_seconds: Max wait before timeout (default from env).
+
+    Returns:
+        Pretty-printed JSON of the gateway's ``result`` field, or an error string.
+    """
+    cfg = _ocr_gateway_config()
+    if not (cfg.url or "").strip():
+        return (
+            "OCR is not configured: set OCR_URL (and usually OCR_API_KEY) in the environment."
+        )
+    client = _get_minio()
+    if client is None:
+        return "Error: MinIO storage is not available."
+    logical = _logical_path_display(path)
+    key = _resolve_minio_key(path)
+    try:
+        file_bytes = client.download_bytes(key)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error downloading from MinIO key '{logical}': {exc}"
+    if len(file_bytes) > _OCR_MINIO_MAX_BYTES:
+        return (
+            f"Error: object is too large for OCR ({len(file_bytes)} bytes; "
+            f"max {_OCR_MINIO_MAX_BYTES})."
+        )
+    file_name = Path(logical).name or "document.bin"
+    mime, _ = mimetypes.guess_type(file_name)
+    content_type = mime or "application/octet-stream"
+    interval, max_wait = _ocr_normalized_poll_params(
+        cfg, poll_interval_seconds, max_wait_seconds
+    )
+    return _ocr_post_multipart_and_poll(
+        cfg, file_name, file_bytes, content_type, doc_type, interval, max_wait
+    )
+
+
 @tool
 async def write_file(path: str, content: str) -> str:
     """Write text content to a file in MinIO object storage.
 
     Args:
-        path: Object path / key inside the bucket, e.g. "reports/summary.txt".
+        path: Path relative to the current run workspace, e.g. "reports/summary.txt".
+              (Stored under ``runs/{agent_name}/{run_id}/...`` when session scoping is enabled.)
         content: The text content to write.
 
     Returns:
-        Confirmation message with the stored object path.
+        Confirmation message with the run-relative path (same as ``path`` when scoped).
     """
     client = _get_minio()
     if client is None:
         return "Error: MinIO storage is not available."
     try:
+        logical = _logical_path_display(path)
+        key = _resolve_minio_key(path)
         encoded = content.encode("utf-8")
-        client.upload_bytes(path, encoded, content_type="text/plain")
+        client.upload_bytes(key, encoded, content_type="text/plain")
 
         # Log to file_artifacts so every write is traceable by run_id / agent
-        await _log_file_artifact(path, len(encoded), "text/plain")
+        await _log_file_artifact(key, len(encoded), "text/plain")
 
-        return f"File written successfully: {path}"
+        return f"File written successfully: {logical}"
     except Exception as exc:  # noqa: BLE001
         return f"Error writing file: {exc}"
 
@@ -222,7 +536,7 @@ async def create_word_file(
     """Create a .docx file and upload it to MinIO.
 
     Args:
-        path: MinIO object path ending with .docx, e.g. "reports/summary.docx".
+        path: Path ending with .docx, relative to the run workspace, e.g. "reports/summary.docx".
         content: Main body content.
         title: Optional heading inserted at the top of the document.
         format: "plain" or "markdown".
@@ -262,10 +576,12 @@ async def create_word_file(
         doc.save(buffer)
         data = buffer.getvalue()
 
+        logical = _logical_path_display(path)
+        key = _resolve_minio_key(path)
         mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        client.upload_bytes(path, data, content_type=mime)
-        await _log_file_artifact(file_path=path, file_size=len(data), content_type=mime)
-        return f"Word file created successfully: {path}"
+        client.upload_bytes(key, data, content_type=mime)
+        await _log_file_artifact(file_path=key, file_size=len(data), content_type=mime)
+        return f"Word file created successfully: {logical}"
     except Exception as exc:  # noqa: BLE001
         logger.error("create_word_file failed: %s", exc)
         return f"Error creating Word file: {exc}"
@@ -502,7 +818,8 @@ async def _load_image_bytes(src: str) -> bytes | None:
     if client is None:
         return None
     try:
-        return client.download_bytes(src)
+        key = _resolve_minio_key(src)
+        return client.download_bytes(key)
     except Exception:  # noqa: BLE001
         return None
 
@@ -604,7 +921,7 @@ def read_file(path: str) -> str:
     """Read a file from MinIO object storage and return its text content.
 
     Args:
-        path: Object path / key inside the bucket, e.g. "reports/summary.txt".
+        path: Run-relative path, e.g. "reports/summary.txt", or a full key starting with "runs/".
 
     Returns:
         The file content as a string, or an error message.
@@ -612,14 +929,16 @@ def read_file(path: str) -> str:
     client = _get_minio()
     if client is None:
         return "Error: MinIO storage is not available."
+    logical = _logical_path_display(path)
+    key = _resolve_minio_key(path)
     try:
-        raw = client.download_bytes(path)
+        raw = client.download_bytes(key)
         text = raw.decode("utf-8", errors="replace")
         if len(text) > 10000:
             text = text[:10000] + f"\n\n[... truncated — {len(raw)} bytes total]"
         return text
     except Exception as exc:  # noqa: BLE001
-        return f"Error reading file '{path}': {exc}"
+        return f"Error reading file '{logical}': {exc}"
 
 
 @tool
@@ -627,20 +946,31 @@ def list_files(prefix: str = "") -> str:
     """List files stored in MinIO under an optional path prefix.
 
     Args:
-        prefix: Optional path prefix to filter results, e.g. "reports/".
+        prefix: Optional run-relative prefix, e.g. "reports/". When session scoping is on,
+                only objects for the current run are listed.
 
     Returns:
-        A newline-separated list of object paths, or a message if empty.
+        A newline-separated list of run-relative paths (or full keys when not scoped).
     """
     client = _get_minio()
     if client is None:
         return "Error: MinIO storage is not available."
     try:
-        objects = client.list_objects(prefix=prefix)
+        base = _run_scoped_minio_prefix()
+        rel = _logical_path_display(prefix) if prefix else ""
+        if base:
+            search_prefix = base + rel
+        else:
+            search_prefix = rel
+        objects = client.list_objects(prefix=search_prefix)
         if not objects:
-            label = f"under prefix '{prefix}'" if prefix else "in storage"
+            if base:
+                label = "in this run's workspace" if not prefix else f"under '{prefix}'"
+            else:
+                label = f"under prefix '{prefix}'" if prefix else "in storage"
             return f"No files found {label}."
-        return "\n".join(objects)
+        display = [_logical_key_for_display(o) for o in objects]
+        return "\n".join(display)
     except Exception as exc:  # noqa: BLE001
         return f"Error listing files: {exc}"
 
@@ -744,6 +1074,9 @@ ALL_BUILTIN_TOOLS = [
     web_search,
     calculate,
     fetch_url,
+    ocr_document,
+    ocr_get_job,
+    ocr_minio_document,
     write_file,
     create_word_file,
     read_file,

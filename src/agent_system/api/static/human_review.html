@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent tool approval</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e6edf3; }
+    body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.35rem; }
+    label { display: block; margin-top: 0.75rem; font-size: 0.85rem; color: #8b949e; }
+    input, textarea, button { width: 100%; box-sizing: border-box; margin-top: 0.25rem; padding: 0.5rem 0.6rem; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #e6edf3; }
+    button { cursor: pointer; width: auto; margin-right: 0.5rem; margin-top: 0.75rem; }
+    button.primary { background: #238636; border-color: #238636; }
+    button.danger { background: #da3633; border-color: #da3633; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+    #decisionBusy { display: none; margin-top: 0.75rem; padding: 0.65rem 0.75rem; border-radius: 6px; background: #21262d; border: 1px solid #30363d; font-size: 0.9rem; }
+    #decisionBusy.active { display: block; }
+    .spinner { display: inline-block; width: 0.9em; height: 0.9em; border: 2px solid #8b949e; border-top-color: #3fb950; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -0.15em; margin-right: 0.4em; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    pre { background: #161b22; border: 1px solid #30363d; padding: 1rem; border-radius: 8px; overflow: auto; max-height: 420px; font-size: 0.8rem; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 200px; }
+    .card { border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-top: 1rem; }
+    .muted { color: #8b949e; font-size: 0.85rem; }
+    .err { color: #f85149; }
+    .ok { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <h1>Human review — high-stakes tool calls</h1>
+  <p class="muted">Set API base URL and key (if <code>API_KEY</code> is set on the server). Load pending runs, inspect the planned tools and arguments, then approve or reject.</p>
+
+  <div class="row">
+    <div>
+      <label for="base">API base URL</label>
+      <input id="base" type="text" placeholder="http://localhost:8080" value="http://localhost:8080" />
+    </div>
+    <div>
+      <label for="key">X-API-Key (optional)</label>
+      <input id="key" type="password" autocomplete="off" placeholder="Leave empty if auth disabled" />
+    </div>
+  </div>
+  <button type="button" class="primary" id="btnRefresh">Refresh pending</button>
+  <p id="status" class="muted"></p>
+
+  <div class="card" id="listCard" style="display:none;">
+    <h2 style="font-size:1rem;">Pending runs</h2>
+    <ul id="pendingList"></ul>
+  </div>
+
+  <div class="card" id="detailCard" style="display:none;">
+    <h2 style="font-size:1rem;">Selected: <span id="selRun"></span></h2>
+    <p class="muted">Agent: <span id="selAgent"></span></p>
+    <pre id="detailJson"></pre>
+    <label for="rejectReason">Reject reason (required to reject)</label>
+    <textarea id="rejectReason" rows="3" placeholder="Explain why the tool batch is rejected…"></textarea>
+    <div id="decisionBusy" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span id="decisionBusyText">Processing…</span></div>
+    <button type="button" class="primary" id="btnApprove">Approve &amp; execute tools</button>
+    <button type="button" class="danger" id="btnReject">Reject &amp; return to agent</button>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none;">
+    <h2 style="font-size:1rem;">Last response</h2>
+    <pre id="resultJson"></pre>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let selectedRunId = null;
+    let selectedAgent = null;
+    let decisionInFlight = false;
+
+    function setDecisionUiBusy(busy, message) {
+      const approve = $("btnApprove");
+      const reject = $("btnReject");
+      const ta = $("rejectReason");
+      const box = $("decisionBusy");
+      if (busy) {
+        decisionInFlight = true;
+        approve.disabled = true;
+        reject.disabled = true;
+        if ($("btnRefresh")) $("btnRefresh").disabled = true;
+        if (ta) ta.disabled = true;
+        box.classList.add("active");
+        $("decisionBusyText").textContent = message || "Sending decision — the agent may take a moment to run tools…";
+      } else {
+        decisionInFlight = false;
+        approve.disabled = false;
+        reject.disabled = false;
+        if ($("btnRefresh")) $("btnRefresh").disabled = false;
+        if (ta) ta.disabled = false;
+        box.classList.remove("active");
+      }
+    }
+
+    function headers() {
+      const h = { "Content-Type": "application/json" };
+      const k = $("key").value.trim();
+      if (k) h["X-API-Key"] = k;
+      return h;
+    }
+    function base() { return $("base").value.replace(/\/$/, ""); }
+
+    async function refreshPending(options = {}) {
+      const quiet = options.quiet === true;
+      if (!quiet) {
+        $("status").textContent = "Loading…";
+        $("status").className = "muted";
+      }
+      try {
+        const r = await fetch(
+          base() + "/review/pending?_=" + Date.now(),
+          { headers: headers(), cache: "no-store" },
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.detail || r.statusText);
+        const ul = $("pendingList");
+        ul.innerHTML = "";
+        (j.pending || []).forEach((p) => {
+          const li = document.createElement("li");
+          const a = document.createElement("a");
+          a.href = "#";
+          a.textContent = p.run_id + " — " + p.agent_name;
+          a.onclick = (e) => { e.preventDefault(); loadDetail(p.run_id); };
+          li.appendChild(a);
+          li.appendChild(document.createTextNode(" — " + (p.task || "").slice(0, 80)));
+          ul.appendChild(li);
+        });
+        $("listCard").style.display = j.count ? "block" : "none";
+        if (!quiet) {
+          $("status").textContent = j.count ? j.count + " pending run(s)." : "No pending approvals.";
+          $("status").className = "ok";
+        }
+      } catch (e) {
+        $("status").textContent = "Error: " + e.message;
+        $("status").className = "err";
+      }
+    }
+
+    async function loadDetail(runId) {
+      selectedRunId = runId;
+      setDecisionUiBusy(false);
+      $("status").textContent = "Loading detail…";
+      try {
+        const r = await fetch(
+          base() + "/review/" + encodeURIComponent(runId) + "?_=" + Date.now(),
+          { headers: headers(), cache: "no-store" },
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.detail || r.statusText);
+        selectedAgent = j.agent_name;
+        $("selRun").textContent = runId;
+        $("selAgent").textContent = j.agent_name;
+        $("detailJson").textContent = JSON.stringify(j.approval_request, null, 2);
+        $("detailCard").style.display = "block";
+        $("status").textContent = "Loaded " + runId;
+        $("status").className = "ok";
+      } catch (e) {
+        $("status").textContent = "Error: " + e.message;
+        $("status").className = "err";
+      }
+    }
+
+    async function decide(action) {
+      if (!selectedRunId || decisionInFlight) return;
+      const body = action === "approve" ? { action: "approve" } : { action: "reject", reason: $("rejectReason").value.trim() };
+      if (action === "reject" && !body.reason) {
+        alert("Enter a reject reason.");
+        return;
+      }
+      const busyMsg = action === "approve"
+        ? "Approved — running tools (this can take a while)…"
+        : "Rejected — returning to agent…";
+      setDecisionUiBusy(true, busyMsg);
+      $("status").textContent = "Request sent — waiting for server…";
+      $("status").className = "muted";
+      try {
+        const r = await fetch(
+          base() + "/review/" + encodeURIComponent(selectedRunId) + "/decide?_=" + Date.now(),
+          {
+            method: "POST",
+            headers: headers(),
+            body: JSON.stringify(body),
+            keepalive: true,
+            cache: "no-store",
+          },
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail));
+        $("resultJson").textContent = JSON.stringify(j, null, 2);
+        $("resultCard").style.display = "block";
+        $("status").textContent = "Done — run_status=" + j.run_status + (j.success ? " (success)" : "");
+        $("status").className = j.run_status === "awaiting_approval" ? "muted" : "ok";
+        $("detailCard").style.display = "none";
+        setDecisionUiBusy(false);
+        selectedRunId = null;
+        await refreshPending({ quiet: true });
+        let statusLine =
+          "Done — run_status=" + j.run_status + (j.success ? " (success)" : "") + " · Pending list updated.";
+        if (j.run_status === "awaiting_approval") {
+          statusLine +=
+            " (run paused again for another tool batch — it stays in the list until fully finished).";
+        }
+        $("status").textContent = statusLine;
+      } catch (e) {
+        $("status").textContent = "Error: " + e.message;
+        $("status").className = "err";
+        setDecisionUiBusy(false);
+      }
+    }
+
+    $("btnRefresh").onclick = refreshPending;
+    $("btnApprove").onclick = () => decide("approve");
+    $("btnReject").onclick = () => decide("reject");
+  </script>
+</body>
+</html>

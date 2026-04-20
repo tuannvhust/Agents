@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     success          BOOLEAN     NOT NULL DEFAULT FALSE,
     reflection_count INTEGER     NOT NULL DEFAULT 0,
     minio_artifacts  JSONB       NOT NULL DEFAULT '[]',
+    run_trace        JSONB       NOT NULL DEFAULT '{}',
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
