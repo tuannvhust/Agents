@@ -166,7 +166,11 @@ async def _ensure_agent_runs_run_trace_column() -> None:
 
 
 async def _restore_agents_from_db() -> None:
-    """Load all persisted AgentConfig rows and rebuild Agent objects in cache."""
+    """Load all persisted AgentConfig rows and rebuild Agent objects in cache.
+
+    Two-pass restoration: sub-agents are built first so that coordinator agents
+    can resolve their invoke_* tools against the already-populated cache.
+    """
     from agent_system.api.routes.agents import _agent_cache
     from agent_system.core.agent import Agent, AgentConfig
 
@@ -178,8 +182,13 @@ async def _restore_agents_from_db() -> None:
         logger.info("No persisted agent configs found — starting fresh.")
         return
 
+    # Sort so sub-agents are restored before coordinators
+    sub_configs = [c for c in configs if c.get("role", "subagent") != "coordinator"]
+    coord_configs = [c for c in configs if c.get("role", "subagent") == "coordinator"]
+    ordered = sub_configs + coord_configs
+
     restored = 0
-    for cfg_dict in configs:
+    for cfg_dict in ordered:
         name = cfg_dict.get("name", "")
         try:
             config = AgentConfig(
@@ -193,8 +202,12 @@ async def _restore_agents_from_db() -> None:
                 tools_requiring_approval=cfg_dict.get("tools_requiring_approval", []),
                 plugins=cfg_dict.get("plugins", []),
                 extra_metadata=cfg_dict.get("extra_metadata", {}),
+                role=cfg_dict.get("role", "subagent"),
+                sub_agents=cfg_dict.get("sub_agents", []),
             )
-            agent = await Agent.create(config, tool_registry=registry)
+            agent = await Agent.create(
+                config, tool_registry=registry, agent_cache=_agent_cache
+            )
             _agent_cache[name] = agent
             restored += 1
         except Exception as exc:  # noqa: BLE001

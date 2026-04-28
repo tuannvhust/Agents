@@ -74,11 +74,13 @@ async def create_agent(
         ],
         plugins=list(payload.plugins or []),
         extra_metadata=payload.extra_metadata,
+        role=payload.role,
+        sub_agents=list(payload.sub_agents or []),
     )
 
     try:
         tool_registry = get_tool_registry()
-        agent = await Agent.create(config, tool_registry=tool_registry)
+        agent = await Agent.create(config, tool_registry=tool_registry, agent_cache=cache)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except Exception as exc:
@@ -240,9 +242,11 @@ def _agent_to_summary(agent: Agent) -> AgentSummary:
         skill_name=agent.config.skill_name,
         model=agent.config.model,
         model_source=agent.config.model_source,
-        tools=agent.config.tools,
+        tools=agent.tool_names,
         tools_requiring_approval=list(agent.config.tools_requiring_approval or []),
         plugins=list(agent.config.plugins or []),
+        role=agent.config.role,
+        sub_agents=list(agent.config.sub_agents or []),
     )
 
 
@@ -258,4 +262,6 @@ def _config_to_dict(config: AgentConfig) -> dict:
         "tools_requiring_approval": list(config.tools_requiring_approval or []),
         "plugins": list(config.plugins or []),
         "extra_metadata": config.extra_metadata,
+        "role": config.role,
+        "sub_agents": list(config.sub_agents or []),
     }

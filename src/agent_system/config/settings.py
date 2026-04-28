@@ -151,6 +151,14 @@ class Settings(BaseSettings):
     cache_conversation_ttl_seconds: int = Field(120, alias="CACHE_CONVERSATION_TTL_SECONDS")
     cache_tool_messages_ttl_seconds: int = Field(120, alias="CACHE_TOOL_MESSAGES_TTL_SECONDS")
 
+    # Multi-agent orchestration: role-specific model overrides.
+    # Coordinator agents default to ORCHESTRATOR_MODEL; sub-agents default to SUBAGENT_MODEL.
+    # Both fall back to OPENROUTER_DEFAULT_MODEL when the role-specific var is unset.
+    orchestrator_model: str | None = Field(None, alias="ORCHESTRATOR_MODEL")
+    orchestrator_model_source: str | None = Field(None, alias="ORCHESTRATOR_MODEL_SOURCE")
+    subagent_model: str | None = Field(None, alias="SUBAGENT_MODEL")
+    subagent_model_source: str | None = Field(None, alias="SUBAGENT_MODEL_SOURCE")
+
     # OCR gateway — flat env so Docker ``env_file`` / project ``.env`` always apply
     ocr_url: str = Field("", alias="OCR_URL")
     ocr_api_key: str = Field("", alias="OCR_API_KEY")

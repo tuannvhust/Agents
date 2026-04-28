@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentConfigRequest(BaseModel):
@@ -48,6 +48,27 @@ class AgentConfigRequest(BaseModel):
         examples=[["safety"]],
     )
     extra_metadata: dict[str, Any] = Field(default_factory=dict)
+    role: Literal["subagent", "coordinator"] = Field(
+        "subagent",
+        description=(
+            "'subagent' — focused worker without reflection (default). "
+            "'coordinator' — orchestrator that delegates to sub-agents via invoke_* tools "
+            "and reflects on the full workflow result."
+        ),
+    )
+    sub_agents: list[str] = Field(
+        default_factory=list,
+        description=(
+            "For coordinators only: names of already-registered sub-agents to wire as "
+            "invoke_* tools. Empty list = all currently registered agents (except self). "
+            "Sub-agents must be registered before the coordinator."
+        ),
+    )
+
+    @field_validator("sub_agents", mode="before")
+    @classmethod
+    def _strip_swagger_placeholders(cls, v: list[str]) -> list[str]:
+        return [n for n in (v or []) if n != "string"]
 
 
 class AgentRunRequest(BaseModel):
@@ -113,6 +134,8 @@ class AgentSummary(BaseModel):
     tools: list[str]
     tools_requiring_approval: list[str] = Field(default_factory=list)
     plugins: list[str] = Field(default_factory=list)
+    role: str = "subagent"
+    sub_agents: list[str] = Field(default_factory=list)
 
 
 class AgentListResponse(BaseModel):

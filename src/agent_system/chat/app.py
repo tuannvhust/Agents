@@ -55,41 +55,50 @@ async def _close_step(step: cl.Step | None) -> None:
             pass
 
 
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-
-@cl.on_chat_start
-async def on_chat_start() -> None:
-    """Initialise infrastructure and show agent selector."""
-    await ensure_initialized()
-
+async def _sync_agent_dropdown(preferred: str | None = None) -> bool:
+    """Redraw the ⚙️ Agent dropdown from the in-memory cache. Returns False if none."""
     agents = list_agents()
-
     if not agents:
-        await cl.Message(
-            content=(
-                "⚠️ **No agents found.**\n\n"
-                "Register an agent via the REST API first, then click **Reload agents**."
-            ),
-        ).send()
         cl.user_session.set("agent_name", None)
-        return
-
-    # Agent selector + settings form
+        return False
+    pref = preferred if preferred is not None else cl.user_session.get("agent_name")
+    initial = pref if pref in agents else agents[0]
     settings = await cl.ChatSettings(
         [
             Select(
                 id="agent",
                 label="Agent",
                 values=agents,
-                initial_value=agents[0],
+                initial_value=initial,
                 description="Choose which agent to talk to.",
             ),
         ]
     ).send()
-
-    selected = settings.get("agent", agents[0])
+    selected = settings.get("agent", initial)
     cl.user_session.set("agent_name", selected)
+    return True
 
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+@cl.on_chat_start
+async def on_chat_start() -> None:
+    """Initialise infrastructure and show agent selector."""
+    await ensure_initialized()
+    # Pick up API-side create/delete without requiring a Chainlit process restart.
+    await reload_agents()
+
+    if not await _sync_agent_dropdown():
+        await cl.Message(
+            content=(
+                "⚠️ **No agents found.**\n\n"
+                "Register an agent via the REST API first, then **start a new chat** "
+                "or type `/reload`."
+            ),
+        ).send()
+        return
+
+    selected = cl.user_session.get("agent_name")
     await cl.Message(
         content=(
             f"👋 Connected to **{selected}**\n\n"
@@ -115,9 +124,19 @@ async def on_settings_update(settings: dict[str, Any]) -> None:
 @cl.action_callback("reload_agents")
 async def _cb_reload(action: cl.Action) -> None:
     await reload_agents()
-    agents = list_agents()
+    names = list_agents()
+    if not await _sync_agent_dropdown():
+        await cl.Message(
+            content="🔄 Reloaded — **no agents** in Postgres. Register via the API.",
+        ).send()
+        return
+    sel = cl.user_session.get("agent_name")
     await cl.Message(
-        content=f"🔄 Agents reloaded. Available: {', '.join(f'`{a}`' for a in agents) or 'none'}",
+        content=(
+            f"🔄 Agents reloaded. Available: {', '.join(f'`{a}`' for a in names) or 'none'}\n\n"
+            f"Selected: **`{sel}`**"
+            + (f"\n\n{_agent_info(sel)}" if sel else "")
+        ),
     ).send()
 
 
@@ -130,9 +149,19 @@ async def on_message(message: cl.Message) -> None:
     # Special commands
     if message.content.strip().lower() in ("/reload", "/refresh"):
         await reload_agents()
-        agents = list_agents()
+        names = list_agents()
+        if not await _sync_agent_dropdown():
+            await cl.Message(
+                content="🔄 Reloaded — **no agents** in Postgres. Register via the API.",
+            ).send()
+            return
+        sel = cl.user_session.get("agent_name")
         await cl.Message(
-            content=f"🔄 Agents reloaded. Available: {', '.join(f'`{a}`' for a in agents) or 'none'}",
+            content=(
+                f"🔄 Agents reloaded. Available: {', '.join(f'`{a}`' for a in names) or 'none'}\n\n"
+                f"Selected: **`{sel}`**"
+                + (f"\n\n{_agent_info(sel)}" if sel else "")
+            ),
         ).send()
         return
 

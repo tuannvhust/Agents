@@ -70,11 +70,15 @@ async def _do_init() -> None:
         logger.debug("Chat: Langfuse init skipped: %s", exc)
 
     # ── Load agents from DB ───────────────────────────────────────────────────
+    # Two-pass: sub-agents first so coordinators can wire invoke_* tools.
     from agent_system.storage.agent_config_store import AgentConfigStore
     store = AgentConfigStore()
     configs = await store.load_all()
 
-    for cfg_dict in configs:
+    sub_configs = [c for c in configs if c.get("role", "subagent") != "coordinator"]
+    coord_configs = [c for c in configs if c.get("role", "subagent") == "coordinator"]
+
+    for cfg_dict in sub_configs + coord_configs:
         name = cfg_dict.get("name", "")
         try:
             config = AgentConfig(
@@ -88,8 +92,12 @@ async def _do_init() -> None:
                 tools_requiring_approval=cfg_dict.get("tools_requiring_approval") or [],
                 plugins=cfg_dict.get("plugins") or [],
                 extra_metadata=cfg_dict.get("extra_metadata") or {},
+                role=cfg_dict.get("role", "subagent"),
+                sub_agents=cfg_dict.get("sub_agents") or [],
             )
-            agent = await Agent.create(config, tool_registry=_tool_registry)
+            agent = await Agent.create(
+                config, tool_registry=_tool_registry, agent_cache=_agent_cache
+            )
             _agent_cache[name] = agent
         except Exception as exc:  # noqa: BLE001
             logger.warning("Chat: could not load agent '%s': %s", name, exc)
@@ -101,14 +109,29 @@ async def _do_init() -> None:
 
 
 async def reload_agents() -> None:
-    """Reload agent configs from DB (call after creating a new agent via API)."""
+    """Reload agent configs from DB (call after creating a new agent via API).
+
+    Two-pass: sub-agents before coordinators so invoke_* tools are wired correctly.
+    Skips agents already in cache; removes agents deleted from DB.
+    """
     global _tool_registry
     if not _initialized or _tool_registry is None:
         return
     from agent_system.storage.agent_config_store import AgentConfigStore
     store = AgentConfigStore()
     configs = await store.load_all()
-    for cfg_dict in configs:
+
+    # Remove agents that were deleted from DB
+    db_names = {c.get("name", "") for c in configs}
+    for gone in list(_agent_cache.keys()):
+        if gone not in db_names:
+            del _agent_cache[gone]
+            logger.info("Chat: removed deleted agent '%s' from cache.", gone)
+
+    sub_configs = [c for c in configs if c.get("role", "subagent") != "coordinator"]
+    coord_configs = [c for c in configs if c.get("role", "subagent") == "coordinator"]
+
+    for cfg_dict in sub_configs + coord_configs:
         name = cfg_dict.get("name", "")
         if name in _agent_cache:
             continue
@@ -124,8 +147,12 @@ async def reload_agents() -> None:
                 tools_requiring_approval=cfg_dict.get("tools_requiring_approval") or [],
                 plugins=cfg_dict.get("plugins") or [],
                 extra_metadata=cfg_dict.get("extra_metadata") or {},
+                role=cfg_dict.get("role", "subagent"),
+                sub_agents=cfg_dict.get("sub_agents") or [],
             )
-            agent = await Agent.create(config, tool_registry=_tool_registry)
+            agent = await Agent.create(
+                config, tool_registry=_tool_registry, agent_cache=_agent_cache
+            )
             _agent_cache[name] = agent
             logger.info("Chat: reloaded agent '%s'.", name)
         except Exception as exc:  # noqa: BLE001

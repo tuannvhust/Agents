@@ -1,20 +1,12 @@
-"""LangGraph agent graph — plan → execute → reflect → (retry | respond).
+"""LangGraph agent graph — two topology variants.
 
-The graph implements a self-correcting ReAct-style loop:
+Coordinator (include_reflection=True):
+  START → [agent] → [tools] → [agent] → ... → [reflect] → END
+                                                   └─ RETRY → [agent]
 
-  START
-    │
-    ▼
-  [agent]  ──── tool calls? ──▶  [tools]  ─┐
-    │                                        │
-    │◀───────────────────────────────────────┘
-    │
-    ▼ (no more tool calls)
-  [reflect] ── DONE ──▶ END
-       │
-       └── RETRY ──▶ [agent]  (inject reflection feedback)
-       │
-       └── FAIL  ──▶ END
+Sub-agent (include_reflection=False):
+  START → [agent] → [tools] → [agent] → ... → END
+  (terminates as soon as the agent produces a text response without tool calls)
 """
 
 from __future__ import annotations
@@ -458,68 +450,116 @@ def build_agent_graph(
     max_reflections: int = MAX_REFLECTIONS,
     tools_requiring_approval: frozenset[str] | None = None,
     plugins: list[AgentPlugin] | None = None,
+    include_reflection: bool = True,
 ) -> Any:
     """Assemble and compile the LangGraph agent graph.
 
-    When ``tools_requiring_approval`` is non-empty, any agent step that plans at least one
-    tool whose name is in that set routes through ``human_approval`` first. The graph is
-    compiled with a checkpointer so LangGraph ``interrupt`` / ``Command(resume=...)`` works.
+    Args:
+        include_reflection: When True (coordinator), a reflect node is added after
+            each agent response.  When False (sub-agent), the graph terminates as
+            soon as the agent produces text without tool calls — no reflect overhead.
+        tools_requiring_approval: Tool names that pause the graph for human review
+            (LangGraph interrupt).  Requires a checkpointer; compiled automatically.
     """
     approval = frozenset(tools_requiring_approval or [])
 
-    def route_after_agent(state: AgentState) -> Literal["tools", "reflect", "human_approval"]:
-        """After agent runs: high-stakes tools → human gate; else tools; else reflect."""
-        messages = state.get("messages", [])
-        if not messages:
-            logger.info("[ROUTE] agent → reflect")
-            return "reflect"
-        last = messages[-1]
-        if not isinstance(last, AIMessage) or not last.tool_calls:
-            logger.info("[ROUTE] agent → reflect")
-            return "reflect"
-        names = [tc["name"] for tc in last.tool_calls]
-        if approval:
-            planned = {tc["name"] for tc in last.tool_calls}
-            if planned & approval:
-                logger.info("[ROUTE] agent → human_approval %s (approval set hit)", names)
-                return "human_approval"
-        logger.info("[ROUTE] agent → tools %s", names)
-        return "tools"
+    if include_reflection:
+        def route_after_agent(
+            state: AgentState,
+        ) -> Literal["tools", "reflect", "human_approval"]:
+            """After agent: high-stakes tools → human gate; tool calls → tools; else → reflect."""
+            messages = state.get("messages", [])
+            if not messages:
+                logger.info("[ROUTE] agent → reflect")
+                return "reflect"
+            last = messages[-1]
+            if not isinstance(last, AIMessage) or not last.tool_calls:
+                logger.info("[ROUTE] agent → reflect")
+                return "reflect"
+            names = [tc["name"] for tc in last.tool_calls]
+            if approval:
+                planned = {tc["name"] for tc in last.tool_calls}
+                if planned & approval:
+                    logger.info("[ROUTE] agent → human_approval %s (approval set hit)", names)
+                    return "human_approval"
+            logger.info("[ROUTE] agent → tools %s", names)
+            return "tools"
+    else:
+        def route_after_agent(  # type: ignore[misc]
+            state: AgentState,
+        ) -> Literal["tools", "__end__", "human_approval"]:
+            """After agent: tool calls → tools; no tool calls → END (no reflection)."""
+            messages = state.get("messages", [])
+            if not messages:
+                logger.info("[ROUTE] agent → END (sub-agent, no messages)")
+                return END
+            last = messages[-1]
+            if not isinstance(last, AIMessage) or not last.tool_calls:
+                logger.info("[ROUTE] agent → END (sub-agent, final response)")
+                return END
+            names = [tc["name"] for tc in last.tool_calls]
+            if approval:
+                planned = {tc["name"] for tc in last.tool_calls}
+                if planned & approval:
+                    logger.info("[ROUTE] agent → human_approval %s (approval set hit)", names)
+                    return "human_approval"
+            logger.info("[ROUTE] agent → tools %s", names)
+            return "tools"
 
     llm_with_tools = llm.bind_tools(tools) if tools else llm
-    reflection_engine = ReflectionEngine(llm=llm, max_retries=max_reflections)
 
     graph = StateGraph(AgentState)
-
     graph.add_node("agent", make_agent_node(llm_with_tools, plugins=plugins or []))
     graph.add_node("tools", make_tools_node(tools))
-    graph.add_node("reflect", make_reflect_node(reflection_engine))
-
     graph.add_edge(START, "agent")
-    if approval:
-        graph.add_node("human_approval", make_human_approval_node())
-        graph.add_conditional_edges(
-            "agent",
-            route_after_agent,
-            {"tools": "tools", "reflect": "reflect", "human_approval": "human_approval"},
-        )
-        graph.add_conditional_edges(
-            "human_approval",
-            route_after_human_approval,
-            {"tools": "tools", "agent": "agent"},
-        )
-    else:
-        graph.add_conditional_edges(
-            "agent",
-            route_after_agent,
-            {"tools": "tools", "reflect": "reflect"},
-        )
     graph.add_edge("tools", "agent")
-    graph.add_conditional_edges(
-        "reflect", route_after_reflection, {"agent": "agent", END: END}
-    )
 
-    if approval:
+    if include_reflection:
+        reflection_engine = ReflectionEngine(llm=llm, max_retries=max_reflections)
+        graph.add_node("reflect", make_reflect_node(reflection_engine))
+        graph.add_conditional_edges(
+            "reflect", route_after_reflection, {"agent": "agent", END: END}
+        )
+        if approval:
+            graph.add_node("human_approval", make_human_approval_node())
+            graph.add_conditional_edges(
+                "agent",
+                route_after_agent,
+                {"tools": "tools", "reflect": "reflect", "human_approval": "human_approval"},
+            )
+            graph.add_conditional_edges(
+                "human_approval",
+                route_after_human_approval,
+                {"tools": "tools", "agent": "agent"},
+            )
+        else:
+            graph.add_conditional_edges(
+                "agent",
+                route_after_agent,
+                {"tools": "tools", "reflect": "reflect"},
+            )
+    else:
+        if approval:
+            graph.add_node("human_approval", make_human_approval_node())
+            graph.add_conditional_edges(
+                "agent",
+                route_after_agent,
+                {"tools": "tools", END: END, "human_approval": "human_approval"},
+            )
+            graph.add_conditional_edges(
+                "human_approval",
+                route_after_human_approval,
+                {"tools": "tools", "agent": "agent"},
+            )
+        else:
+            graph.add_conditional_edges(
+                "agent",
+                route_after_agent,
+                {"tools": "tools", END: END},
+            )
+
+    needs_checkpointer = bool(approval)
+    if needs_checkpointer:
         return graph.compile(checkpointer=get_checkpoint_saver())
     return graph.compile()
 

@@ -127,6 +127,13 @@ class AgentConfig:
     # Currently supported: "safety"
     plugins: list[str] = field(default_factory=list)
     extra_metadata: dict[str, Any] = field(default_factory=dict)
+    # Multi-agent orchestration role.
+    # "coordinator" — orchestrates sub-agents, includes reflection, uses ORCHESTRATOR_MODEL.
+    # "subagent"    — focused worker, no reflection node, uses SUBAGENT_MODEL.
+    role: Literal["subagent", "coordinator"] = "subagent"
+    # For coordinators: names of sub-agents to wire as invoke_* tools.
+    # Empty list means all agents currently in the cache (excluding self).
+    sub_agents: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -170,9 +177,29 @@ class Agent:
         self._tools = tools
         self._storage = storage
 
+        # Resolve effective model: explicit config > role-specific env default > global default
+        _settings = get_settings()
+        if config.model is not None:
+            _effective_model: str | None = config.model
+        elif config.role == "coordinator":
+            _effective_model = _settings.orchestrator_model  # None → openrouter default
+        else:
+            _effective_model = _settings.subagent_model  # None → openrouter default
+
+        # Resolve effective model_source: explicit config > role-specific env override
+        if config.role == "coordinator" and _settings.orchestrator_model_source:
+            _effective_source: str = _settings.orchestrator_model_source
+        elif config.role == "subagent" and _settings.subagent_model_source:
+            _effective_source = _settings.subagent_model_source
+        else:
+            _effective_source = config.model_source
+
+        self._effective_model = _effective_model
+        self._effective_source = _effective_source
+
         llm = get_llm(
-            model=config.model,
-            source=config.model_source,
+            model=_effective_model,
+            source=_effective_source,
             temperature=config.temperature,
         )
 
@@ -193,19 +220,21 @@ class Agent:
             plugin_instances.append(plugin_cls(llm=llm))
             logger.info("Agent '%s': loaded plugin '%s'", config.name, plugin_name)
 
+        _reflect = config.role == "coordinator"
         self._graph = build_agent_graph(
             llm=llm,
             tools=tools,
             max_reflections=config.max_reflections,
             tools_requiring_approval=frozenset(config.tools_requiring_approval or []),
             plugins=plugin_instances,
+            include_reflection=_reflect,
         )
 
         # Streaming graph: same topology but LLM has streaming=True so token-level
         # events fire via astream_events.  Used by stream_run / resume_stream_run.
         streaming_llm = get_llm(
-            model=config.model,
-            source=config.model_source,
+            model=_effective_model,
+            source=_effective_source,
             temperature=config.temperature,
             streaming=True,
         )
@@ -215,15 +244,19 @@ class Agent:
             max_reflections=config.max_reflections,
             tools_requiring_approval=frozenset(config.tools_requiring_approval or []),
             plugins=plugin_instances,
+            include_reflection=_reflect,
         )
 
         logger.info(
-            "Agent '%s' initialised with skill='%s', tools=%s, model='%s', "
-            "approval_tools=%s, plugins=%s",
+            "Agent '%s' [role=%s] initialised | skill='%s' | tools=%s | model='%s' (%s) | "
+            "reflection=%s | approval_tools=%s | plugins=%s",
             config.name,
+            config.role,
             config.skill_name,
             [t.name for t in tools],
-            config.model or get_settings().openrouter.default_model,
+            _effective_model or _settings.openrouter.default_model,
+            _effective_source,
+            _reflect,
             list(config.tools_requiring_approval or []) or "—",
             [p.name for p in plugin_instances] or "—",
         )
@@ -235,8 +268,16 @@ class Agent:
         cls,
         config: AgentConfig,
         tool_registry: Any | None = None,
+        agent_cache: dict[str, "Agent"] | None = None,
     ) -> "Agent":
-        """Async factory: loads skill + resolves tools, then constructs Agent."""
+        """Async factory: loads skill, resolves tools, wires sub-agent invoke tools (coordinator).
+
+        Args:
+            config: Agent configuration.
+            tool_registry: Registry of builtin / MCP tools to attach.
+            agent_cache: Live agent cache; required for coordinators so invoke_* tools
+                can be wired to already-registered sub-agents.
+        """
         loader = SkillLoader()
         skill = loader.load(config.skill_name)
 
@@ -245,6 +286,39 @@ class Agent:
             tools = tool_registry.get_many(config.tools)
         elif tool_registry and not config.tools:
             tools = tool_registry.all()
+
+        # For coordinator agents: prepend invoke_<name> tools for each sub-agent.
+        if config.role == "coordinator" and agent_cache:
+            from agent_system.core.invoke_tools import make_invoke_agent_tools
+
+            if config.sub_agents:
+                missing = [n for n in config.sub_agents if n not in agent_cache]
+                if missing:
+                    logger.warning(
+                        "Coordinator '%s': sub-agent(s) %s not found in cache and will be skipped. "
+                        "Register sub-agents before the coordinator.",
+                        config.name, missing,
+                    )
+                sub_agent_map = {
+                    n: agent_cache[n]
+                    for n in config.sub_agents
+                    if n in agent_cache
+                }
+            else:
+                # No explicit list → wire all currently registered agents (except self)
+                sub_agent_map = {
+                    n: a for n, a in agent_cache.items() if n != config.name
+                }
+
+            if sub_agent_map:
+                invoke_tools = make_invoke_agent_tools(sub_agent_map)
+                tools = invoke_tools + tools
+            else:
+                logger.warning(
+                    "Coordinator '%s': no sub-agents available to wire. "
+                    "Register sub-agents first.",
+                    config.name,
+                )
 
         storage: MinIOClient | None = None
         try:
@@ -272,8 +346,8 @@ class Agent:
         logger.info("  task      : %s", task)
         logger.info(
             "  model     : %s (%s)",
-            self._config.model or get_settings().openrouter.default_model,
-            self._config.model_source,
+            self._effective_model or get_settings().openrouter.default_model,
+            self._effective_source,
         )
         logger.info(
             "  tools (%d) : %s",
@@ -630,14 +704,28 @@ class Agent:
         task = pending.task
         clear_pending(run_id)
 
+        from agent_system.tracing import get_langfuse_handler, is_tracing_enabled
+
+        callbacks = []
+        if is_tracing_enabled():
+            handler = get_langfuse_handler()
+            if handler is not None:
+                callbacks = [handler]
+                logger.debug("  Langfuse tracing attached for resume stream run %s", run_id)
+
         invoke_config: dict = {
             "configurable": {
                 "thread_id": run_id,
                 "agent_name": self._config.name,
             },
+            "callbacks": callbacks,
             "metadata": {
+                "langfuse_session_id": run_id,
+                "langfuse_trace_name": f"{self._config.name}/{run_id}",
+                "langfuse_tags": [self._config.name, self._config.skill_name],
                 "session_id": run_id,
                 "agent_name": self._config.name,
+                "skill": self._config.skill_name,
             },
         }
 
@@ -691,14 +779,28 @@ class Agent:
         task: str,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Core streaming logic shared by stream_run and resume_stream_run."""
+        from agent_system.tracing import get_langfuse_handler, is_tracing_enabled
+
+        callbacks = []
+        if is_tracing_enabled():
+            handler = get_langfuse_handler()
+            if handler is not None:
+                callbacks = [handler]
+                logger.debug("  Langfuse tracing attached for stream run %s", run_id)
+
         invoke_config: dict = {
             "configurable": {
                 "thread_id": run_id,
                 "agent_name": self._config.name,
             },
+            "callbacks": callbacks,
             "metadata": {
+                "langfuse_session_id": run_id,
+                "langfuse_trace_name": f"{self._config.name}/{run_id}",
+                "langfuse_tags": [self._config.name, self._config.skill_name],
                 "session_id": run_id,
                 "agent_name": self._config.name,
+                "skill": self._config.skill_name,
             },
         }
 
@@ -872,6 +974,11 @@ class Agent:
     @property
     def config(self) -> AgentConfig:
         return self._config
+
+    @property
+    def tool_names(self) -> list[str]:
+        """Actual tool names attached to this agent (includes invoke_* for coordinators)."""
+        return [t.name for t in self._tools]
 
     # ── Private ───────────────────────────────────────────────────────────────
 
