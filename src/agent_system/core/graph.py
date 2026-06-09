@@ -11,8 +11,12 @@ Sub-agent (include_reflection=False):
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import io
 import json
 import logging
+import os
 from typing import Annotated, Any, Literal, Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -61,6 +65,8 @@ class AgentState(TypedDict, total=False):
     trace_events: list[dict]
     # Set by human_approval node: next edge target ("tools" | "agent")
     human_approval_next: str
+    # Optional image URL consumed by the ocr pre-processing node (enable_ocr=True agents)
+    image_url: str
 
 
 # ── Node implementations ──────────────────────────────────────────────────────
@@ -442,6 +448,142 @@ def route_after_reflection(state: AgentState) -> Literal["agent", "__end__"]:
     return "agent"
 
 
+# ── Image resolution helper ───────────────────────────────────────────────────
+
+def _resolve_image_to_data_url(image_input: str) -> str:
+    """Normalise *image_input* to a value the vision LLM API will accept.
+
+    Accepted inputs
+    ---------------
+    - ``https://`` / ``http://`` URL  → returned unchanged (provider fetches it)
+    - ``data:image/...;base64,...``   → returned unchanged (already encoded)
+    - Local file path (abs or rel)   → file is read, first page rendered at 200 DPI,
+      JPEG-encoded, and returned as ``data:image/jpeg;base64,<b64>``
+
+    PDF support requires ``pdf2image`` + system ``poppler-utils``.
+    Other formats (JPEG, PNG, WEBP, TIFF …) require ``Pillow``.
+    """
+    if image_input.startswith(("http://", "https://", "data:")):
+        return image_input
+
+    if not os.path.exists(image_input):
+        raise FileNotFoundError(
+            f"[OCR] Local file not found: {image_input!r}. "
+            "For Docker deployments use paths under /ocr_input/ (host ocr_input/ is mounted there)."
+        )
+
+    _, ext = os.path.splitext(image_input.lower())
+
+    if ext == ".pdf":
+        try:
+            from pdf2image import convert_from_path  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "pdf2image is required to process PDF files. "
+                "Install it: pip install pdf2image  "
+                "(also ensure poppler-utils is installed on the system)."
+            ) from exc
+        pages = convert_from_path(image_input, dpi=200, first_page=1, last_page=1)
+        if not pages:
+            raise ValueError(f"[OCR] Could not render any pages from PDF: {image_input!r}")
+        img = pages[0]
+        logger.info("[OCR] rendered PDF page 1 at 200 DPI (%dx%d)", img.width, img.height)
+    else:
+        try:
+            from PIL import Image  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "Pillow is required to process local image files. "
+                "Install it: pip install Pillow"
+            ) from exc
+        img = Image.open(image_input)
+        img.load()
+        logger.info("[OCR] opened local image %s (%dx%d, mode=%s)", ext, img.width, img.height, img.mode)
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    logger.info("[OCR] encoded image to base64 JPEG (%d bytes)", buf.tell())
+    return f"data:image/jpeg;base64,{b64}"
+
+
+# ── OCR pre-processing node ───────────────────────────────────────────────────
+
+def make_ocr_node(vlm: BaseChatModel, ocr_skill_name: str):
+    """Return an async node that calls a vision LLM before the main agent loop.
+
+    The node:
+      1. Loads the OCR system prompt from Langfuse (TTL-cached via SkillLoader).
+      2. Sends the image URL + task to the VLM in a multimodal message.
+      3. Appends the extracted text as a HumanMessage so the agent node can
+         reason over it without ever needing to call OCR as a tool.
+
+    The node fires only when ``state["image_url"]`` is non-empty (enforced by
+    ``route_start`` in ``build_agent_graph``).
+    """
+    from agent_system.core.skill_loader import SkillLoader
+
+    _loader = SkillLoader()  # cheap — reuses the process-level Langfuse singleton
+
+    async def ocr_node(state: AgentState) -> dict[str, Any]:
+        image_url: str = state.get("image_url", "")
+        task: str = state.get("task", "")
+
+        logger.info(_SEP)
+        logger.info("[OCR NODE] resolving image input: %.100s", image_url)
+
+        # Resolve local paths / PDFs → base64 data URL (runs in thread to avoid blocking)
+        loop = asyncio.get_event_loop()
+        resolved_url: str = await loop.run_in_executor(
+            None, _resolve_image_to_data_url, image_url
+        )
+
+        if resolved_url.startswith("data:"):
+            logger.info("[OCR NODE] image resolved to base64 data URL (%d chars)", len(resolved_url))
+        else:
+            logger.info("[OCR NODE] image is remote URL, using as-is")
+
+        skill = _loader.load(ocr_skill_name)
+        messages: list[BaseMessage] = [
+            SystemMessage(content=skill.system_prompt),
+            HumanMessage(content=[
+                {"type": "image_url", "image_url": {"url": resolved_url}},
+                # Use a neutral extraction instruction — the user's task is reserved for
+                # the reasoning agent node that runs after this node.  Passing `task` here
+                # would cause the VLM to respond to the user's question instead of just
+                # extracting data from the image.
+                {"type": "text", "text": "Extract all information from this image."},
+            ]),
+        ]
+
+        response: AIMessage = await vlm.ainvoke(messages)
+        ocr_text = str(response.content)
+
+        logger.info("[OCR NODE] extracted %d chars from image", len(ocr_text))
+        logger.debug("[OCR NODE] preview: %.400s", ocr_text[:400])
+
+        prior_trace = list(state.get("trace_events") or [])
+        ocr_step: dict[str, Any] = {
+            "type": "ocr",
+            # Store original input (not the base64 blob) to keep trace readable
+            "image_source": image_url if not image_url.startswith("data:") else "<base64 input>",
+            "resolved_as": "data_url" if resolved_url.startswith("data:") else "remote_url",
+            "skill": ocr_skill_name,
+            "extracted_chars": len(ocr_text),
+            "preview": ocr_text[:200],
+        }
+
+        return {
+            "messages": [HumanMessage(content=f"[OCR Result]:\n{ocr_text}")],
+            "trace_events": prior_trace + [ocr_step],
+        }
+
+    return ocr_node
+
+
 # ── Graph builder ─────────────────────────────────────────────────────────────
 
 def build_agent_graph(
@@ -451,6 +593,9 @@ def build_agent_graph(
     tools_requiring_approval: frozenset[str] | None = None,
     plugins: list[AgentPlugin] | None = None,
     include_reflection: bool = True,
+    enable_ocr: bool = False,
+    ocr_vlm: BaseChatModel | None = None,
+    ocr_skill_name: str = "ocr",
 ) -> Any:
     """Assemble and compile the LangGraph agent graph.
 
@@ -460,6 +605,13 @@ def build_agent_graph(
             soon as the agent produces text without tool calls — no reflect overhead.
         tools_requiring_approval: Tool names that pause the graph for human review
             (LangGraph interrupt).  Requires a checkpointer; compiled automatically.
+        enable_ocr: When True, a vision LLM pre-processing node is inserted before
+            the main agent node.  The node fires only when ``image_url`` is present
+            in the initial state; otherwise the graph flows directly to ``agent``.
+        ocr_vlm: The vision LLM to use in the OCR node.  Required when
+            ``enable_ocr=True``; ignored otherwise.
+        ocr_skill_name: Langfuse prompt name (or local skill file) that provides
+            the OCR system prompt.  Defaults to ``"ocr"``.
     """
     approval = frozenset(tools_requiring_approval or [])
 
@@ -511,8 +663,24 @@ def build_agent_graph(
     graph = StateGraph(AgentState)
     graph.add_node("agent", make_agent_node(llm_with_tools, plugins=plugins or []))
     graph.add_node("tools", make_tools_node(tools))
-    graph.add_edge(START, "agent")
     graph.add_edge("tools", "agent")
+
+    # ── OCR pre-processing node (opt-in per agent) ─────────────────────────
+    if enable_ocr and ocr_vlm is not None:
+        graph.add_node("ocr", make_ocr_node(ocr_vlm, ocr_skill_name))
+        graph.add_edge("ocr", "agent")
+
+        def route_start(state: AgentState) -> Literal["ocr", "agent"]:
+            """Route to ocr when an image is present; skip directly to agent otherwise."""
+            if state.get("image_url", ""):
+                logger.info("[ROUTE] START → ocr (image_url present)")
+                return "ocr"
+            logger.info("[ROUTE] START → agent (no image_url)")
+            return "agent"
+
+        graph.add_conditional_edges(START, route_start, {"ocr": "ocr", "agent": "agent"})
+    else:
+        graph.add_edge(START, "agent")
 
     if include_reflection:
         reflection_engine = ReflectionEngine(llm=llm, max_retries=max_reflections)

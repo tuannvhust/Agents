@@ -64,6 +64,32 @@ class AgentConfigRequest(BaseModel):
             "Sub-agents must be registered before the coordinator."
         ),
     )
+    enable_ocr: bool = Field(
+        False,
+        description=(
+            "When True, a vision LLM pre-processing node is added before the main agent "
+            "loop.  The node fires only when image_url is provided at run time."
+        ),
+    )
+    ocr_model: str | None = Field(
+        None,
+        description=(
+            "Vision LLM model for the OCR node.  Falls back to OCR_MODEL env var when "
+            "omitted.  Only used when enable_ocr=True."
+        ),
+        examples=["qwen/qwen2-vl-7b-instruct"],
+    )
+    ocr_model_source: Literal["openrouter", "local"] | None = Field(
+        None,
+        description="Backend for the OCR VLM.  Falls back to OCR_MODEL_SOURCE env var.",
+    )
+    ocr_skill_name: str = Field(
+        "ocr",
+        description=(
+            "Langfuse prompt name (or local skills/<name>.md) used as the OCR system "
+            "prompt.  Defaults to 'ocr'."
+        ),
+    )
 
     @field_validator("sub_agents", mode="before")
     @classmethod
@@ -82,6 +108,14 @@ class AgentRunRequest(BaseModel):
     include_trace: bool = Field(
         False,
         description="If true, include the full structured run trace in the response (can be large).",
+    )
+    image_url: str | None = Field(
+        None,
+        description=(
+            "Optional image URL.  When provided and the agent has enable_ocr=True, "
+            "the vision LLM node processes the image before the main agent loop."
+        ),
+        examples=["https://example.com/invoice.png"],
     )
 
 
@@ -136,6 +170,8 @@ class AgentSummary(BaseModel):
     plugins: list[str] = Field(default_factory=list)
     role: str = "subagent"
     sub_agents: list[str] = Field(default_factory=list)
+    enable_ocr: bool = False
+    ocr_skill_name: str = "ocr"
 
 
 class AgentListResponse(BaseModel):

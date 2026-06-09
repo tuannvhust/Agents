@@ -204,6 +204,10 @@ async def _restore_agents_from_db() -> None:
                 extra_metadata=cfg_dict.get("extra_metadata", {}),
                 role=cfg_dict.get("role", "subagent"),
                 sub_agents=cfg_dict.get("sub_agents", []),
+                enable_ocr=cfg_dict.get("enable_ocr", False),
+                ocr_model=cfg_dict.get("ocr_model"),
+                ocr_model_source=cfg_dict.get("ocr_model_source"),
+                ocr_skill_name=cfg_dict.get("ocr_skill_name", "ocr"),
             )
             agent = await Agent.create(
                 config, tool_registry=registry, agent_cache=_agent_cache

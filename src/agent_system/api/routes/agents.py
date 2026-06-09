@@ -76,6 +76,10 @@ async def create_agent(
         extra_metadata=payload.extra_metadata,
         role=payload.role,
         sub_agents=list(payload.sub_agents or []),
+        enable_ocr=payload.enable_ocr,
+        ocr_model=payload.ocr_model,
+        ocr_model_source=payload.ocr_model_source,
+        ocr_skill_name=payload.ocr_skill_name,
     )
 
     try:
@@ -143,7 +147,11 @@ async def run_agent(
 ) -> AgentRunResponse:
     """Trigger a synchronous agent run and return the final answer."""
     agent = _get_or_404(name, cache)
-    result = await agent.run(task=payload.task, session_id=payload.session_id)
+    result = await agent.run(
+        task=payload.task,
+        session_id=payload.session_id,
+        image_url=payload.image_url,
+    )
 
     return AgentRunResponse(
         agent_name=result.agent_name,
@@ -247,6 +255,8 @@ def _agent_to_summary(agent: Agent) -> AgentSummary:
         plugins=list(agent.config.plugins or []),
         role=agent.config.role,
         sub_agents=list(agent.config.sub_agents or []),
+        enable_ocr=agent.config.enable_ocr,
+        ocr_skill_name=agent.config.ocr_skill_name,
     )
 
 
@@ -264,4 +274,8 @@ def _config_to_dict(config: AgentConfig) -> dict:
         "extra_metadata": config.extra_metadata,
         "role": config.role,
         "sub_agents": list(config.sub_agents or []),
+        "enable_ocr": config.enable_ocr,
+        "ocr_model": config.ocr_model,
+        "ocr_model_source": config.ocr_model_source,
+        "ocr_skill_name": config.ocr_skill_name,
     }

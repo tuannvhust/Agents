@@ -77,6 +77,9 @@ def _process_graph_event(
         if ev_name == "human_approval":
             return {"kind": "status", "text": "⏸ Waiting for approval…"}
 
+        if ev_name == "ocr":
+            return {"kind": "status", "text": "🔍 Running OCR…"}
+
     # ── LLM token streaming (only fires when streaming=True LLM) ─────────────
     elif ev_type == "on_chat_model_stream" and node == "agent":
         chunk = (event.get("data") or {}).get("chunk")
@@ -134,6 +137,16 @@ class AgentConfig:
     # For coordinators: names of sub-agents to wire as invoke_* tools.
     # Empty list means all agents currently in the cache (excluding self).
     sub_agents: list[str] = field(default_factory=list)
+    # OCR pre-processing: when True, a vision LLM node is inserted before the
+    # main agent loop.  Fires only when image_url is supplied at run time.
+    enable_ocr: bool = False
+    # Vision model for the OCR node.  Falls back to OCR_MODEL env var when None.
+    ocr_model: str | None = None
+    # Model source for the OCR VLM ("openrouter" | "local").  Falls back to
+    # OCR_MODEL_SOURCE env var, then to the agent's own model_source.
+    ocr_model_source: Literal["openrouter", "local"] | None = None
+    # Langfuse prompt name (or local skill file) used as the OCR system prompt.
+    ocr_skill_name: str = "ocr"
 
 
 @dataclass
@@ -220,6 +233,28 @@ class Agent:
             plugin_instances.append(plugin_cls(llm=llm))
             logger.info("Agent '%s': loaded plugin '%s'", config.name, plugin_name)
 
+        # ── OCR vision LLM (opt-in) ────────────────────────────────────────────
+        ocr_vlm = None
+        if config.enable_ocr:
+            _ocr_model = config.ocr_model or _settings.ocr_model
+            _ocr_source: str = (
+                config.ocr_model_source
+                or _settings.ocr_model_source
+                or _effective_source
+            )
+            ocr_vlm = get_llm(
+                model=_ocr_model,
+                source=_ocr_source,
+                temperature=0.0,
+            )
+            logger.info(
+                "Agent '%s': OCR enabled | vlm='%s' (%s) | skill='%s'",
+                config.name,
+                _ocr_model or _settings.openrouter.default_model,
+                _ocr_source,
+                config.ocr_skill_name,
+            )
+
         _reflect = config.role == "coordinator"
         self._graph = build_agent_graph(
             llm=llm,
@@ -228,6 +263,9 @@ class Agent:
             tools_requiring_approval=frozenset(config.tools_requiring_approval or []),
             plugins=plugin_instances,
             include_reflection=_reflect,
+            enable_ocr=config.enable_ocr,
+            ocr_vlm=ocr_vlm,
+            ocr_skill_name=config.ocr_skill_name,
         )
 
         # Streaming graph: same topology but LLM has streaming=True so token-level
@@ -245,11 +283,14 @@ class Agent:
             tools_requiring_approval=frozenset(config.tools_requiring_approval or []),
             plugins=plugin_instances,
             include_reflection=_reflect,
+            enable_ocr=config.enable_ocr,
+            ocr_vlm=ocr_vlm,
+            ocr_skill_name=config.ocr_skill_name,
         )
 
         logger.info(
             "Agent '%s' [role=%s] initialised | skill='%s' | tools=%s | model='%s' (%s) | "
-            "reflection=%s | approval_tools=%s | plugins=%s",
+            "reflection=%s | ocr=%s | approval_tools=%s | plugins=%s",
             config.name,
             config.role,
             config.skill_name,
@@ -257,6 +298,7 @@ class Agent:
             _effective_model or _settings.openrouter.default_model,
             _effective_source,
             _reflect,
+            config.enable_ocr,
             list(config.tools_requiring_approval or []) or "—",
             [p.name for p in plugin_instances] or "—",
         )
@@ -333,8 +375,19 @@ class Agent:
     _SEP_HEAVY = "=" * 72
     _SEP_LIGHT = "-" * 72
 
-    async def run(self, task: str, session_id: str | None = None) -> AgentRunResult:
-        """Execute the agent on a task and return a structured result."""
+    async def run(
+        self,
+        task: str,
+        session_id: str | None = None,
+        image_url: str | None = None,
+    ) -> AgentRunResult:
+        """Execute the agent on a task and return a structured result.
+
+        Args:
+            image_url: Optional URL of an image to process.  When provided and the
+                agent has ``enable_ocr=True``, the OCR node will call the vision LLM
+                before the main agent loop.  Ignored by agents without OCR enabled.
+        """
         run_id = session_id or str(uuid.uuid4())
         start_time = time.monotonic()
 
@@ -375,6 +428,7 @@ class Agent:
             "agent_name": self._config.name,  # tools_node re-binds RunContext (LangGraph task isolation)
             "tool_call_records": [],
             "trace_events": [],
+            "image_url": image_url or "",
         }
 
         try:
@@ -652,6 +706,7 @@ class Agent:
         self,
         task: str,
         session_id: str | None = None,
+        image_url: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Async generator that streams execution events for a new agent run.
 
@@ -662,6 +717,10 @@ class Agent:
           - ``"done"``          run completed — includes final_answer, artifacts, run_id
           - ``"approval_needed"`` run paused for human review — includes run_id + payload
           - ``"error"``         unrecoverable failure — includes text
+
+        Args:
+            image_url: Optional image URL forwarded to the OCR pre-processing node
+                when the agent has ``enable_ocr=True``.
         """
         run_id = session_id or str(uuid.uuid4())
         initial_state: AgentState = {
@@ -677,6 +736,7 @@ class Agent:
             "agent_name": self._config.name,
             "tool_call_records": [],
             "trace_events": [],
+            "image_url": image_url or "",
         }
         async for ev in self._stream_graph(
             self._streaming_graph, initial_state, run_id, task

@@ -5,6 +5,7 @@ WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Use setuptools (matches pyproject.toml build-backend)
@@ -26,15 +27,16 @@ FROM python:3.11-slim AS runtime
 LABEL maintainer="Agent System"
 LABEL description="Multi-agent system with LangGraph, MCP, MinIO, ElasticSearch"
 
-# ── Install Node.js 20 LTS ────────────────────────────────────────────────────
-# Required so the MCP client can spawn MCP servers via `npx` as child processes.
+# ── System dependencies ───────────────────────────────────────────────────────
+# poppler-utils: required by pdf2image to render PDF pages for the OCR node.
+# Node.js 20 LTS: required so the MCP client can spawn MCP servers via `npx`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg \
+        poppler-utils \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/* \
-    # Verify
     && node --version && npx --version
 
 # ── Non-root user (with home directory so npm cache works) ────────────────────
@@ -54,7 +56,7 @@ COPY --from=builder /install /usr/local
 
 # Copy source, skills, and guardrails (SafetyPlugin local rules)
 COPY src/ src/
-COPY skills/ skills/
+COPY prompts/ prompts/
 COPY guardrails/ guardrails/
 
 RUN chown -R appuser:appuser /app
@@ -78,6 +80,7 @@ LABEL description="Chainlit chat UI for the Agent System"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg \
+        poppler-utils \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y --auto-remove curl gnupg \
@@ -97,7 +100,7 @@ WORKDIR /app
 COPY --from=builder-chat /install /usr/local
 
 COPY src/ src/
-COPY skills/ skills/
+COPY prompts/ prompts/
 COPY guardrails/ guardrails/
 
 RUN chown -R appuser:appuser /app

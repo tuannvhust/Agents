@@ -58,7 +58,8 @@ User / API / Chainlit UI
 - **Human-in-the-loop** — pause before high-stakes tools; Reviewer UI + resume API
 - **Chainlit chat UI** — streaming chat interface with agent selector, step indicators, and approval dialogs
 - **Redis cache** — cache-aside layer for DB reads (agent memory, run metadata, tool calls); Postgres remains source of truth
-- **Skills** — loaded from local files or Langfuse (`local` / `langfuse` / `hybrid` with TTL)
+- **Prompts** — agent prompts loaded from `prompts/` (local) or Langfuse (`local` / `langfuse` / `hybrid` with TTL); supports subdirectory layout (`roles/`, `agents/`, `ocr/`) with backward-compatible flat-name fallback
+- **OCR pre-processing node** — opt-in vision LLM node that runs before the agent loop; accepts HTTP URLs or local file paths (PDF → JPEG conversion via `pdf2image`); prompt loaded from `prompts/ocr/`
 - **Built-in tools + MCP tools** — web search, file I/O, MinIO, OCR, math, memory, …
 - **MinIO session scoping** — all tool-written objects are namespaced under `runs/{agent}/{run_id}/`
 - **Langfuse tracing** — all runs (REST API and Chainlit) emit traces with `session_id`, `agent_name`, `skill` metadata
@@ -151,7 +152,7 @@ curl -s -X POST "$BASE/agents" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "researcher",
-    "skill_name": "researcher",
+    "skill_name": "roles/researcher",
     "role": "subagent",
     "plugins": ["safety"]
   }' | python3 -m json.tool
@@ -161,25 +162,21 @@ curl -s -X POST "$BASE/agents" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "analyst",
-    "skill_name": "analyst",
+    "skill_name": "roles/analyst",
     "role": "subagent",
     "plugins": ["safety"]
   }' | python3 -m json.tool
 
-# OCR agent — optional: limit tools (omit the "tools" key to allow everything)
+# CCCD processor — OCR-enabled agent with vision LLM pre-processing
 curl -s -X POST "$BASE/agents" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "ocr_agent",
-    "skill_name": "ocr_agent",
+    "name": "cccd_agent",
+    "skill_name": "agents/cccd_processor",
     "role": "subagent",
-    "tools": [
-      "get_datetime",
-      "list_files",
-      "ocr_document",
-      "ocr_minio_document",
-      "ocr_get_job"
-    ]
+    "enable_ocr": true,
+    "ocr_skill_name": "ocr/cccd",
+    "tools": ["calculate"]
   }' | python3 -m json.tool
 ```
 
@@ -192,14 +189,14 @@ curl -s -X POST "$BASE/agents" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "coordinator",
-    "skill_name": "coordinator",
+    "skill_name": "agents/coordinator",
     "role": "coordinator",
-    "sub_agents": ["researcher", "analyst", "ocr_agent"],
+    "sub_agents": ["researcher", "analyst"],
     "plugins": ["safety"]
   }' | python3 -m json.tool
 ```
 
-The response `tools` field will list `invoke_researcher`, `invoke_analyst`, `invoke_ocr_agent` plus any direct tools.
+The response `tools` field will list `invoke_researcher`, `invoke_analyst` plus any direct tools.
 
 ### Step 3 — Verify all agents are registered
 
@@ -334,7 +331,7 @@ curl -s -X POST "$BASE/agents" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "researcher-gated",
-    "skill_name": "researcher",
+    "skill_name": "roles/researcher",
     "role": "subagent",
     "tools_requiring_approval": ["create_word_file", "write_file"]
   }' | python3 -m json.tool
@@ -455,17 +452,106 @@ Exports (result.json, trace.json) go to `runs/{agent_name}/{run_id}/_exports/`.
 
 ---
 
-## Available Skills
+## Available Prompts
 
-| Skill file | Best agent role |
-|-----------|----------------|
-| `skills/coordinator.md` | `coordinator` |
-| `skills/researcher.md` | `subagent` |
-| `skills/analyst.md` | `subagent` |
-| `skills/coder.md` | `subagent` |
-| `skills/ocr_agent.md` | `subagent` |
+Prompts live in `./prompts/` organised into three subdirectories:
 
-Create new `.md` files in `./skills/` to define custom agent roles. Set `SKILLS_SOURCE=hybrid` to also manage skills in Langfuse with a local fallback.
+### `prompts/roles/` — Role personas (generic, reusable across agents)
+
+| `skill_name` | Description |
+|---|---|
+| `roles/researcher` | Research specialist — returns sourced facts with confidence ratings |
+| `roles/analyst` | Data analyst — extracts patterns and insights from research |
+| `roles/writer` | Report writer — turns analysis into polished, structured prose |
+| `roles/reviewer` | Quality reviewer — checks reports against source data |
+| `roles/coder` | Senior software engineer — writes production-quality, multi-language code |
+
+### `prompts/agents/` — Agent workflow definitions (specific to one agent type)
+
+| `skill_name` | Description |
+|---|---|
+| `agents/coordinator` | Multi-agent coordinator — decomposes tasks and delegates to sub-agents |
+| `agents/cccd_processor` | CCCD document intelligence — enriches OCR output with age, province, user-provided fields |
+
+### `prompts/ocr/` — VLM extraction prompts (used by `ocr_node` only)
+
+| `ocr_skill_name` | Description |
+|---|---|
+| `ocr/cccd` | Extracts structured JSON fields from Vietnamese Citizen Identity Card images |
+
+### Adding custom prompts
+
+Create a new `.md` file anywhere under `./prompts/` and reference it by its relative path without the extension:
+
+```bash
+# prompts/roles/legal_analyst.md → skill_name: "roles/legal_analyst"
+# prompts/ocr/invoice.md        → ocr_skill_name: "ocr/invoice"
+```
+
+Set `SKILLS_SOURCE=hybrid` to also manage prompts in Langfuse with local fallback. Use the same relative-path naming convention for Langfuse prompt names.
+
+---
+
+## OCR Pre-processing Node
+
+Agents can have a **vision LLM node** inserted before the main agent loop. The node fires only when `image_url` is provided at run time — agents without `enable_ocr` are unaffected.
+
+### Register an OCR-enabled agent
+
+```bash
+curl -s -X POST "$BASE/agents" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "cccd_agent",
+    "skill_name": "agents/cccd_processor",
+    "role": "subagent",
+    "enable_ocr": true,
+    "ocr_skill_name": "ocr/cccd",
+    "tools": ["calculate"]
+  }' | python3 -m json.tool
+```
+
+### Run with an image
+
+```bash
+# Remote HTTP URL
+curl -s -X POST "$BASE/agents/cccd_agent/run" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Extract all fields. The person is married and works as an engineer.",
+    "image_url": "https://example.com/cccd.jpg"
+  }' | python3 -m json.tool
+
+# Local file path (Docker: mount host dir as /ocr_input/)
+curl -s -X POST "$BASE/agents/cccd_agent/run" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Extract all fields.",
+    "image_url": "/ocr_input/document.pdf"
+  }' | python3 -m json.tool
+```
+
+### OCR configuration
+
+```env
+# Vision LLM for the OCR node (must support image input)
+OCR_MODEL=qwen/qwen2-vl-7b-instruct
+OCR_MODEL_SOURCE=openrouter
+```
+
+### Graph topology with OCR enabled
+
+```
+START
+  ├─ image_url present? → [ocr]  ─────┐
+  └─ no image_url ──────────────────┐  │
+                                    ▼  ▼
+                                 [agent] → [tools] → [agent] → END
+```
+
+The OCR node calls the vision LLM with the `ocr_skill_name` system prompt and appends the extracted text as `[OCR Result]` in the message history. The reasoning agent then uses both the user's typed task and the extracted text.
+
+> **PDF support** requires `poppler-utils` on the system (already included in the Dockerfile). PDFs are rendered at 200 DPI and JPEG-encoded before being sent to the VLM.
 
 ---
 
@@ -512,7 +598,7 @@ psql postgresql://agent:agent@localhost:5433/agentdb -c "SELECT name, config->>'
 curl -s -X DELETE http://localhost:8080/agents/coordinator
 curl -s -X DELETE http://localhost:8080/agents/researcher
 curl -s -X DELETE http://localhost:8080/agents/analyst
-curl -s -X DELETE http://localhost:8080/agents/ocr_agent
+curl -s -X DELETE http://localhost:8080/agents/cccd_agent
 
 # Stop stack (keep data volumes)
 docker compose down

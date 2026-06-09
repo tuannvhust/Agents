@@ -94,24 +94,63 @@ class SkillDefinition:
 # ── Local source ──────────────────────────────────────────────────────────────
 
 class LocalSkillSource:
-    """Reads skills from ``*.md`` files in a local directory."""
+    """Reads skills from ``*.md`` files in a local directory (including subdirectories).
+
+    Skill names map directly to relative paths under the skills directory:
+
+    - ``"personas/researcher"``  →  ``skills/personas/researcher.md``
+    - ``"agents/cccd_processor"`` →  ``skills/agents/cccd_processor.md``
+    - ``"ocr/cccd"``             →  ``skills/ocr/cccd.md``
+
+    **Backward compatibility**: if the exact path is not found, the loader searches
+    recursively for a file whose stem matches the name.  This allows agents registered
+    in the DB with old flat names (e.g. ``"researcher"``) to resolve automatically to
+    their new subdirectory location (``skills/personas/researcher.md``) without requiring
+    a DB migration.  A warning is logged so the operator knows to update the agent config.
+    """
 
     def __init__(self, skills_dir: str | Path) -> None:
         self._dir = Path(skills_dir)
 
     def load(self, name: str) -> SkillDefinition:
+        # Primary: exact relative path (new convention)
         candidate = self._dir / f"{name}.md"
-        if not candidate.exists():
-            raise FileNotFoundError(
-                f"Skill '{name}' not found locally. "
-                f"Expected: {candidate}"
+        if candidate.exists():
+            content = candidate.read_text(encoding="utf-8")
+            logger.debug("Loaded skill '%s' from local file %s", name, candidate)
+            return SkillDefinition(name=name, content=content, source="local")
+
+        # Fallback: recursive search by stem (backward compat for flat names in DB)
+        stem = Path(name).name  # "personas/researcher" → "researcher"
+        matches = sorted(self._dir.rglob(f"{stem}.md"))
+        if len(matches) == 1:
+            resolved = matches[0]
+            resolved_name = resolved.relative_to(self._dir).with_suffix("").as_posix()
+            logger.warning(
+                "Skill '%s' not found at '%s'; resolved via recursive search to '%s'. "
+                "Update the agent's skill_name to '%s' to silence this warning.",
+                name, candidate, resolved, resolved_name,
             )
-        content = candidate.read_text(encoding="utf-8")
-        logger.debug("Loaded skill '%s' from local file %s", name, candidate)
-        return SkillDefinition(name=name, content=content, source="local")
+            content = resolved.read_text(encoding="utf-8")
+            return SkillDefinition(name=resolved_name, content=content, source="local")
+        if len(matches) > 1:
+            raise FileNotFoundError(
+                f"Skill '{name}' is ambiguous — multiple files match the stem '{stem}': "
+                f"{[str(m) for m in matches]}. Use the full relative path to disambiguate."
+            )
+
+        raise FileNotFoundError(
+            f"Skill '{name}' not found locally. "
+            f"Expected: {candidate}  "
+            f"(also searched recursively for '{stem}.md' — no match found)"
+        )
 
     def list_skills(self) -> list[str]:
-        return [p.stem for p in sorted(self._dir.glob("*.md"))]
+        """Return all skill names as relative paths (e.g. 'personas/researcher')."""
+        return [
+            p.relative_to(self._dir).with_suffix("").as_posix()
+            for p in sorted(self._dir.rglob("*.md"))
+        ]
 
 
 # ── Langfuse source (with TTL cache) ─────────────────────────────────────────

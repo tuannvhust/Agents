@@ -29,7 +29,14 @@ async def debug_skills():
     # ── local skills ──────────────────────────────────────────────────────────
     from pathlib import Path
     local_dir = Path(cfg.local_dir)
-    local_skills = [p.stem for p in sorted(local_dir.glob("*.md"))] if local_dir.exists() else []
+    local_skills = (
+        [
+            p.relative_to(local_dir).with_suffix("").as_posix()
+            for p in sorted(local_dir.rglob("*.md"))
+        ]
+        if local_dir.exists()
+        else []
+    )
 
     # ── Langfuse skills + cache ───────────────────────────────────────────────
     from agent_system.core.skill_loader import _get_langfuse_source

@@ -79,7 +79,7 @@ class ElasticSearchSettings(BaseSettings):
 class SkillsSettings(BaseSettings):
     # "local" | "langfuse" | "hybrid"  (hybrid = langfuse preferred, local fallback)
     source: str = Field("hybrid", alias="SKILLS_SOURCE")
-    local_dir: str = Field("./skills", alias="SKILLS_LOCAL_DIR")
+    local_dir: str = Field("./prompts", alias="SKILLS_LOCAL_DIR")
     # How long (seconds) a Langfuse-fetched skill stays in cache before re-fetching
     langfuse_expiry_time: float = Field(100.0, alias="LANGFUSE_EXPIRY_TIME")
 
@@ -158,6 +158,11 @@ class Settings(BaseSettings):
     orchestrator_model_source: str | None = Field(None, alias="ORCHESTRATOR_MODEL_SOURCE")
     subagent_model: str | None = Field(None, alias="SUBAGENT_MODEL")
     subagent_model_source: str | None = Field(None, alias="SUBAGENT_MODEL_SOURCE")
+
+    # Vision LLM used by the OCR pre-processing node (enable_ocr=True agents).
+    # Falls back to OPENROUTER_DEFAULT_MODEL when unset.
+    ocr_model: str | None = Field(None, alias="OCR_MODEL")
+    ocr_model_source: str | None = Field(None, alias="OCR_MODEL_SOURCE")
 
     # OCR gateway — flat env so Docker ``env_file`` / project ``.env`` always apply
     ocr_url: str = Field("", alias="OCR_URL")

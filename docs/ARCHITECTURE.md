@@ -65,7 +65,6 @@ Entry: [`src/agent_system/main.py`](../src/agent_system/main.py) runs Uvicorn wi
 | **Storage** | Config, runs, MinIO | [`storage/agent_config_store.py`](../src/agent_system/storage/agent_config_store.py), [`storage/run_store.py`](../src/agent_system/storage/run_store.py), [`storage/minio_client.py`](../src/agent_system/storage/minio_client.py) |
 | **Cross-cutting** | Langfuse callbacks | [`tracing.py`](../src/agent_system/tracing.py) |
 
-Optional **ADK proxies** under [`src/agent_system/adk/`](../src/agent_system/adk/) (`coder_proxy`, `researcher_proxy`, `analyst_proxy`) sit beside the main stack for integration-style agents.
 
 ```mermaid
 flowchart LR

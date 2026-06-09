@@ -44,6 +44,8 @@ def _agent_info(name: str) -> str:
         lines.append(f"**Approval gates**: {', '.join(f'`{t}`' for t in needs_approval)}")
     if agent.config.plugins:
         lines.append(f"**Plugins**: {', '.join(f'`{p}`' for p in agent.config.plugins)}")
+    if getattr(agent.config, "enable_ocr", False):
+        lines.append(f"**OCR**: ✅ enabled (`{agent.config.ocr_skill_name}`) — attach an image or PDF to activate")
     return "\n".join(lines)
 
 
@@ -181,10 +183,35 @@ async def on_message(message: cl.Message) -> None:
         ).send()
         return
 
-    await _run_agent(agent, message.content.strip())
+    # Extract the first attached file / image (used as image_url for OCR-enabled agents)
+    image_url: str | None = None
+    for el in message.elements or []:
+        path = getattr(el, "path", None)
+        if path:
+            image_url = path
+            logger.info("Chainlit attachment detected: %s (mime=%s)", path, getattr(el, "mime", "?"))
+            break
+
+    task = message.content.strip()
+
+    # If the user attached a file but typed no text, supply a default task so the
+    # agent has a clear instruction.  For OCR-enabled agents this triggers the full
+    # extract-and-analyse pipeline driven by the skill prompt.
+    if not task and image_url:
+        if getattr(agent.config, "enable_ocr", False):
+            task = "Extract and analyse the attached document."
+        else:
+            task = "Process the attached file."
+        logger.info("Empty task with attachment — using default: %r", task)
+
+    if not task:
+        await cl.Message(content="⚠️ Please type a message or attach a file.").send()
+        return
+
+    await _run_agent(agent, task, image_url=image_url)
 
 
-async def _run_agent(agent: Any, task: str) -> None:
+async def _run_agent(agent: Any, task: str, image_url: str | None = None) -> None:
     """Stream an agent run, rendering status steps and the final answer."""
     answer_msg = cl.Message(content="")
     active_step: cl.Step | None = None
@@ -219,7 +246,7 @@ async def _run_agent(agent: Any, task: str) -> None:
         active_step = None
 
     try:
-        async for event in agent.stream_run(task=task):
+        async for event in agent.stream_run(task=task, image_url=image_url):
             kind = event.get("kind")
 
             if kind == "status":
