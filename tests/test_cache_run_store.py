@@ -34,3 +34,27 @@ def test_get_run_store_is_plain_run_store_when_cache_disabled(reset_run_store_si
     get_settings.cache_clear()
     store = get_run_store()
     assert isinstance(store, RunStore)
+
+
+def test_caching_run_store_delegates_queue_lifecycle_methods():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_system.storage.caching_run_store import CachingRunStore
+
+    inner = MagicMock()
+    inner.save_queued_run = AsyncMock(return_value=True)
+    inner.update_run_status = AsyncMock(return_value=True)
+    inner.ensure_run_row = AsyncMock(return_value=True)
+    redis = MagicMock()
+    redis.delete = AsyncMock()
+
+    store = CachingRunStore(
+        inner,
+        redis,
+        memory_ttl_seconds=60,
+        conversation_ttl_seconds=60,
+        tool_messages_ttl_seconds=60,
+    )
+    assert hasattr(store, "save_queued_run")
+    assert hasattr(store, "update_run_status")
+    assert hasattr(store, "ensure_run_row")

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import FileResponse
 
 from agent_system.api.routes.agents import get_cache
-from agent_system.api.schemas import AgentResumeRequest, AgentRunResponse
+from agent_system.api.schemas import AgentResumeRequest, RunAcceptedResponse
 from agent_system.api.security import require_api_key
 from agent_system.core.agent import Agent
 from agent_system.core.interrupt_registry import get_pending, list_pending
@@ -56,7 +56,7 @@ def _no_store_headers(response: Response) -> None:
 @router.get("/pending", summary="List runs waiting for tool approval")
 async def review_pending(response: Response) -> dict:
     _no_store_headers(response)
-    pending = list_pending()
+    pending = await list_pending()
     return {
         "pending": [
             {
@@ -74,7 +74,7 @@ async def review_pending(response: Response) -> dict:
 @router.get("/{run_id}", summary="Get pending approval payload for a run")
 async def review_detail(run_id: str, response: Response) -> dict:
     _no_store_headers(response)
-    p = get_pending(run_id)
+    p = await get_pending(run_id)
     if p is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -91,18 +91,19 @@ async def review_detail(run_id: str, response: Response) -> dict:
 
 @router.post(
     "/{run_id}/decide",
-    response_model=AgentRunResponse,
-    summary="Approve or reject the paused tool batch",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=RunAcceptedResponse,
+    summary="Approve or reject the paused tool batch (async)",
 )
 async def review_decide(
     run_id: str,
     payload: AgentResumeRequest,
     response: Response,
     cache: Annotated[dict[str, Agent], Depends(get_cache)],
-) -> AgentRunResponse:
+) -> RunAcceptedResponse:
     _no_store_headers(response)
     async with _lock_for_decide(run_id):
-        pending = get_pending(run_id)
+        pending = await get_pending(run_id)
         if pending is None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -116,8 +117,7 @@ async def review_decide(
                 status.HTTP_400_BAD_REQUEST,
                 detail="Provide a non-empty 'reason' when action is 'reject'.",
             )
-        agent = cache.get(pending.agent_name)
-        if agent is None:
+        if pending.agent_name not in cache:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 detail=f"Agent '{pending.agent_name}' is not loaded.",
@@ -127,22 +127,29 @@ async def review_decide(
             if payload.action == "approve"
             else {"action": "reject", "reason": (payload.reason or "").strip()}
         )
-        try:
-            result = await agent.resume_run(run_id=run_id, decision=decision)
-        except ValueError as exc:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    return AgentRunResponse(
-        agent_name=result.agent_name,
-        run_id=result.run_id,
-        task=result.task,
-        final_answer=result.final_answer,
-        success=result.success,
-        reflection_count=result.reflection_count,
-        messages_count=result.messages_count,
-        stored_artifacts=result.stored_artifacts,
-        error=result.error,
-        run_status=result.run_status,
-        approval_request=result.approval_request,
-        trace=None,
+        from agent_system.api.app import get_run_store
+        from agent_system.config import get_settings
+        from agent_system.queue import enqueue_agent_resume
+
+        cfg = get_settings()
+        if not cfg.queue_enabled:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Job queue is disabled (QUEUE_ENABLED=false).",
+            )
+
+        await get_run_store().update_run_status(run_id, "queued")
+        job_id = await enqueue_agent_resume(
+            agent_name=pending.agent_name,
+            run_id=run_id,
+            decision=decision,
+        )
+
+    return RunAcceptedResponse(
+        agent_name=pending.agent_name,
+        run_id=run_id,
+        task=pending.task,
+        job_id=job_id,
+        poll_url=f"/agents/{pending.agent_name}/runs/{run_id}",
     )

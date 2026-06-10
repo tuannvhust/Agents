@@ -226,7 +226,7 @@ flowchart TB
 
 ## Data responsibilities (how to explain storage)
 
-- **PostgreSQL (`agent-postgres`)**: `agent_configs` (JSONB per agent, including `plugins`), `agent_runs` (final fields + `run_trace` JSONB), tool/memory-related tables used by `RunStore` (see [`init-db/01_agent_schema.sql`](../init-db/01_agent_schema.sql) and [`storage/run_store.py`](../src/agent_system/storage/run_store.py)).
+- **PostgreSQL (`agent-postgres`)**: `agent_configs` (JSONB per agent, including `plugins`), `agent_runs` (final fields + `run_trace` JSONB), tool/memory-related tables used by `RunStore` (see [`init-db/01_schema.sql`](../init-db/01_schema.sql) and [`storage/run_store.py`](../src/agent_system/storage/run_store.py)).
 - **MinIO**: file artifacts and exported run artifacts (e.g. `trace.json` prefixes under session/run paths — see [`storage/session_paths.py`](../src/agent_system/storage/session_paths.py)).
 - **Langfuse**: LLM/tool callback traces when keys are set ([`tracing.py`](../src/agent_system/tracing.py)); optional **named prompts** for skills and guardrails (hybrid loading with TTL cache).
 - **Elasticsearch**: application logs via the logging pipeline ([`logging/elastic_logger.py`](../src/agent_system/logging/elastic_logger.py)).

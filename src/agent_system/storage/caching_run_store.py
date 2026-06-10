@@ -138,6 +138,56 @@ class CachingRunStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Redis memory_save cache update failed: %s", exc)
 
+    async def ensure_run_row(
+        self,
+        run_id: str,
+        agent_name: str,
+        task: str,
+        run_status: str = "running",
+    ) -> bool:
+        ok = await self._inner.ensure_run_row(run_id, agent_name, task, run_status)
+        if ok:
+            await self._redis_delete(self._k_run(run_id))
+        return ok
+
+    async def save_queued_run(
+        self,
+        run_id: str,
+        agent_name: str,
+        task: str,
+        job_id: str | None = None,
+        input_file: str | None = None,
+    ) -> bool:
+        ok = await self._inner.save_queued_run(
+            run_id, agent_name, task, job_id=job_id, input_file=input_file
+        )
+        if ok:
+            await self._redis_delete(self._k_run(run_id))
+        return ok
+
+    async def update_run_status(
+        self,
+        run_id: str,
+        run_status: str,
+        error_message: str | None = None,
+    ) -> bool:
+        ok = await self._inner.update_run_status(run_id, run_status, error_message)
+        if ok:
+            await self._redis_delete(self._k_run(run_id))
+        return ok
+
+    async def update_job_id(self, run_id: str, job_id: str) -> bool:
+        ok = await self._inner.update_job_id(run_id, job_id)
+        if ok:
+            await self._redis_delete(self._k_run(run_id))
+        return ok
+
+    async def update_input_file(self, run_id: str, input_file: str) -> bool:
+        ok = await self._inner.update_input_file(run_id, input_file)
+        if ok:
+            await self._redis_delete(self._k_run(run_id))
+        return ok
+
     async def save_run(
         self,
         run_id: str,
@@ -148,6 +198,10 @@ class CachingRunStore:
         reflection_count: int,
         minio_artifacts: list[str] | None = None,
         run_trace: dict[str, Any] | None = None,
+        run_status: str = "completed",
+        error_message: str | None = None,
+        job_id: str | None = None,
+        input_file: str | None = None,
     ) -> bool:
         ok = await self._inner.save_run(
             run_id,
@@ -158,6 +212,10 @@ class CachingRunStore:
             reflection_count,
             minio_artifacts,
             run_trace,
+            run_status,
+            error_message,
+            job_id=job_id,
+            input_file=input_file,
         )
         if ok:
             await self._redis_delete(self._k_run(run_id), self._k_tc(run_id))

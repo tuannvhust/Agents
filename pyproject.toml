@@ -63,6 +63,11 @@ dependencies = [
 
     # Optional Redis cache (repository read-through) — used when CACHE_ENABLED=true
     "redis>=5.0.0,<6.0.0",
+
+    # Async job queue (agent runs) via RabbitMQ + shared LangGraph checkpoints (Postgres)
+    "aio-pika>=9.4.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "psycopg[binary,pool]>=3.2.0",
     # psycopg2 kept for the MCP @modelcontextprotocol/server-postgres child process
     "psycopg2-binary>=2.9.0",
 ]
@@ -82,6 +87,7 @@ dev = [
 ]
 [project.scripts]
 agent-system = "agent_system.main:main"
+agent-worker = "agent_system.worker.main:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

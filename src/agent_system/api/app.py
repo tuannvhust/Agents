@@ -86,83 +86,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(cfg.app.log_level)
     logger.info("Starting Agent System v%s", __version__)
 
-    # ── Database pool (asyncpg) ───────────────────────────────────────────────
-    from agent_system.database import close_pool, init_pool
-    await init_pool(cfg.agent_postgres_url)
+    from agent_system.runtime.bootstrap import bootstrap_shutdown, bootstrap_startup
 
-    if _cache_redis_active(cfg):
-        from agent_system.cache.redis_client import init_redis
+    await bootstrap_startup(load_agents=True)
 
-        logger.info("Connecting Redis cache at startup (CACHE_ENABLED=true, CACHE_TYPE=redis).")
-        await init_redis(cfg.cache_redis_url)
-    elif cfg.cache_enabled:
+    if cfg.queue_enabled:
+        from agent_system.queue import close_queue_pool, init_queue_pool
+
+        await init_queue_pool(cfg.rabbitmq_url)
+        logger.info("RabbitMQ job queue enabled (RABBITMQ_URL).")
+    elif cfg.cache_enabled and cfg.cache_type.lower().strip() != "redis":
         logger.warning(
             "CACHE_ENABLED=true but CACHE_TYPE=%r is not 'redis'; skipping Redis startup.",
             cfg.cache_type,
         )
 
-    # Ensure agent_configs table exists (idempotent — harmless on every start)
-    await _ensure_agent_configs_table()
-
-    # Older agent-postgres volumes may lack run_trace; app code expects it (see init-db/02_run_trace_column.sql)
-    await _ensure_agent_runs_run_trace_column()
-
-    # ── Built-in tools + MCP tools ────────────────────────────────────────────
-    registry = get_tool_registry()
-    _register_builtin_tools(registry)
-    await registry.load_mcp_tools()
-    logger.info("Tool registry ready with %d tool(s).", len(registry))
-
-    # ── Langfuse tracing ──────────────────────────────────────────────────────
-    from agent_system.tracing import init_langfuse_handler
-    init_langfuse_handler()
-
-    # ── Restore agents from DB ────────────────────────────────────────────────
-    await _restore_agents_from_db()
-
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("Agent System shutting down.")
-    if _cache_redis_active(cfg):
-        from agent_system.cache.redis_client import close_redis
+    if cfg.queue_enabled:
+        from agent_system.queue import close_queue_pool
 
-        await close_redis()
-    await close_pool()
-
-
-async def _ensure_agent_configs_table() -> None:
-    """Create agent_configs if it does not exist (moved from AgentConfigStore._ensure_table)."""
-    from agent_system.database import get_pool
-    try:
-        async with get_pool().acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS agent_configs (
-                    name        TEXT        PRIMARY KEY,
-                    config      JSONB       NOT NULL,
-                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-        logger.debug("agent_configs table ensured.")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not ensure agent_configs table: %s", exc)
-
-
-async def _ensure_agent_runs_run_trace_column() -> None:
-    """Add run_trace to agent_runs if missing (existing DBs created before the column existed)."""
-    from agent_system.database import get_pool
-    try:
-        async with get_pool().acquire() as conn:
-            await conn.execute(
-                """
-                ALTER TABLE agent_runs
-                    ADD COLUMN IF NOT EXISTS run_trace JSONB NOT NULL DEFAULT '{}'::jsonb
-                """
-            )
-        logger.debug("agent_runs.run_trace column ensured.")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not ensure agent_runs.run_trace column: %s", exc)
+        await close_queue_pool()
+    await bootstrap_shutdown()
 
 
 async def _restore_agents_from_db() -> None:
@@ -267,10 +213,12 @@ def create_app() -> FastAPI:
         files_router,
         health_router,
         review_router,
+        runs_router,
     )
 
     app.include_router(health_router)
     app.include_router(agents_router)
+    app.include_router(runs_router)
     app.include_router(review_router)
     app.include_router(debug_router)
     app.include_router(files_router)

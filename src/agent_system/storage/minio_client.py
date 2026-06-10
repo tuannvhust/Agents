@@ -119,6 +119,31 @@ class MinIOClient:
         objects = self._client.list_objects(self._cfg.bucket, prefix=prefix, recursive=True)
         return [obj.object_name for obj in objects]
 
+    def upload_input_file(
+        self,
+        agent_name: str,
+        run_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> str:
+        """Upload a run's input file and return the canonical MinIO object path.
+
+        Path convention: ``runs/{agent_name}/{run_id}/inputs/{filename}``
+        """
+        import mimetypes
+        if content_type == "application/octet-stream":
+            guessed, _ = mimetypes.guess_type(filename)
+            if guessed:
+                content_type = guessed
+        object_name = f"runs/{agent_name}/{run_id}/inputs/{filename}"
+        self.upload_bytes(object_name, data, content_type)
+        logger.info(
+            "Stored input file → %s/%s (%d bytes)",
+            self._cfg.bucket, object_name, len(data),
+        )
+        return object_name
+
     def delete_object(self, object_name: str) -> None:
         self._require_client()
         self._client.remove_object(self._cfg.bucket, object_name)

@@ -33,6 +33,8 @@ from dataclasses import dataclass
 class RunContext:
     run_id: str
     agent_name: str
+    # Propagated from the top-level run request; forwarded to OCR-enabled sub-agents.
+    image_url: str | None = None
 
 
 # Module-level ContextVar — each asyncio Task inherits a copy from its parent,

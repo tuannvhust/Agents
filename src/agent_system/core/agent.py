@@ -168,6 +168,14 @@ class AgentRunResult:
     approval_request: dict[str, Any] | None = None
 
 
+def _persist_status_fields(result: AgentRunResult) -> tuple[str, str | None]:
+    if result.run_status == "awaiting_approval":
+        return "awaiting_approval", None
+    if result.error:
+        return "failed", result.error
+    return "completed", None
+
+
 class Agent:
     """Encapsulates a fully-configured agent ready to execute tasks.
 
@@ -473,7 +481,13 @@ class Agent:
 
             # Set run context so tools (e.g. write_file) can log file_artifacts
             from agent_system.core.run_context import RunContext, run_ctx
-            ctx_token = run_ctx.set(RunContext(run_id=run_id, agent_name=self._config.name))
+            ctx_token = run_ctx.set(
+                RunContext(
+                    run_id=run_id,
+                    agent_name=self._config.name,
+                    image_url=image_url or None,
+                )
+            )
 
             logger.info("  invoking LangGraph...")
             try:
@@ -489,7 +503,7 @@ class Agent:
 
             intr_payload = self._extract_interrupt_payload(final_state)
             if intr_payload is not None:
-                register_pending(self._config.name, run_id, task, intr_payload)
+                await register_pending(self._config.name, run_id, task, intr_payload)
                 logger.info("  run paused — awaiting human approval for tool execution")
                 result = AgentRunResult(
                     agent_name=self._config.name,
@@ -507,7 +521,7 @@ class Agent:
                 await self._persist_paused_for_approval(run_id, task, final_state)
             else:
                 result = await self._finalize_completed_run(run_id, task, final_state)
-                clear_pending(run_id)
+                await clear_pending(run_id)
         except SafetyViolation as exc:
             # Expected guardrail outcome — not an application error; avoid ERROR/traceback noise.
             logger.info(
@@ -568,15 +582,24 @@ class Agent:
         """Resume after a human-in-the-loop interrupt. ``decision`` is
         ``{"action": "approve"}`` or ``{"action": "reject", "reason": "..."}``.
         """
-        pending = get_pending(run_id)
-        if pending is None or pending.agent_name != self._config.name:
+        pending = await get_pending(run_id)
+        if pending is not None and pending.agent_name != self._config.name:
             raise ValueError(
                 f"No pending approval for run_id={run_id!r} and agent={self._config.name!r}."
             )
-        task = pending.task
-        # Drop from the in-memory reviewer queue immediately while the graph resumes.
-        # If the run hits another approval gate, we register again below.
-        clear_pending(run_id)
+        if pending is not None:
+            task = pending.task
+        else:
+            from agent_system.api.app import get_run_store
+
+            row = await get_run_store().fetch_run(run_id)
+            if row is None or row.get("agent_name") != self._config.name:
+                raise ValueError(
+                    f"No pending approval for run_id={run_id!r} and agent={self._config.name!r}."
+                )
+            task = row["task"]
+        # Drop from the reviewer queue immediately while the graph resumes.
+        await clear_pending(run_id)
 
         start_time = time.monotonic()
 
@@ -614,7 +637,9 @@ class Agent:
             }
 
             from agent_system.core.run_context import RunContext, run_ctx
-            ctx_token = run_ctx.set(RunContext(run_id=run_id, agent_name=self._config.name))
+            ctx_token = run_ctx.set(
+                RunContext(run_id=run_id, agent_name=self._config.name)
+            )
 
             logger.info("  resuming LangGraph with operator decision...")
             try:
@@ -629,7 +654,7 @@ class Agent:
 
             intr_payload = self._extract_interrupt_payload(final_state)
             if intr_payload is not None:
-                register_pending(self._config.name, run_id, task, intr_payload)
+                await register_pending(self._config.name, run_id, task, intr_payload)
                 logger.info("  run paused again — another approval gate")
                 result = AgentRunResult(
                     agent_name=self._config.name,
@@ -647,7 +672,7 @@ class Agent:
                 await self._persist_paused_for_approval(run_id, task, final_state)
             else:
                 result = await self._finalize_completed_run(run_id, task, final_state)
-                clear_pending(run_id)
+                await clear_pending(run_id)
         except SafetyViolation as exc:
             logger.info(
                 "AGENT RESUME BLOCKED BY GUARDRAIL  |  agent=%s  |  run_id=%s  |  %s",
@@ -753,7 +778,7 @@ class Agent:
         ``decision`` is ``{"action": "approve"}`` or
         ``{"action": "reject", "reason": "…"}``.
         """
-        pending = get_pending(run_id)
+        pending = await get_pending(run_id)
         if pending is None or pending.agent_name != self._config.name:
             yield {
                 "kind": "error",
@@ -762,7 +787,7 @@ class Agent:
             return
 
         task = pending.task
-        clear_pending(run_id)
+        await clear_pending(run_id)
 
         from agent_system.tracing import get_langfuse_handler, is_tracing_enabled
 
@@ -790,7 +815,9 @@ class Agent:
         }
 
         from agent_system.core.run_context import RunContext, run_ctx
-        ctx_token = run_ctx.set(RunContext(run_id=run_id, agent_name=self._config.name))
+        ctx_token = run_ctx.set(
+            RunContext(run_id=run_id, agent_name=self._config.name)
+        )
         final_graph_output: dict[str, Any] = {}
 
         try:
@@ -812,11 +839,11 @@ class Agent:
             final_state = await self._finalize_invoke_state(invoke_config, final_graph_output)
             intr_payload = self._extract_interrupt_payload(final_state)
             if intr_payload is not None:
-                register_pending(self._config.name, run_id, task, intr_payload)
+                await register_pending(self._config.name, run_id, task, intr_payload)
                 yield {"kind": "approval_needed", "run_id": run_id, "payload": intr_payload}
             else:
                 result_obj = await self._finalize_completed_run(run_id, task, final_state)
-                clear_pending(run_id)
+                await clear_pending(run_id)
                 yield {
                     "kind": "done",
                     "run_id": run_id,
@@ -867,7 +894,13 @@ class Agent:
         await self._pre_insert_run(run_id, task)
 
         from agent_system.core.run_context import RunContext, run_ctx
-        ctx_token = run_ctx.set(RunContext(run_id=run_id, agent_name=self._config.name))
+        ctx_token = run_ctx.set(
+            RunContext(
+                run_id=run_id,
+                agent_name=self._config.name,
+                image_url=initial_state.get("image_url") or None,
+            )
+        )
         final_graph_output: dict[str, Any] = {}
 
         try:
@@ -888,7 +921,7 @@ class Agent:
             intr_payload = self._extract_interrupt_payload(final_state)
 
             if intr_payload is not None:
-                register_pending(self._config.name, run_id, task, intr_payload)
+                await register_pending(self._config.name, run_id, task, intr_payload)
                 await self._persist_paused_for_approval(run_id, task, final_state)
                 yield {
                     "kind": "approval_needed",
@@ -897,7 +930,7 @@ class Agent:
                 }
             else:
                 result_obj = await self._finalize_completed_run(run_id, task, final_state)
-                clear_pending(run_id)
+                await clear_pending(run_id)
                 yield {
                     "kind": "done",
                     "run_id": run_id,
@@ -1054,14 +1087,10 @@ class Agent:
             store = get_run_store()
             if store is None:
                 return
-            ok = await store.save_run(
+            ok = await store.ensure_run_row(
                 run_id=run_id,
                 agent_name=self._config.name,
                 task=task,
-                final_answer="",
-                success=False,
-                reflection_count=0,
-                minio_artifacts=[],
             )
             if not ok:
                 logger.error("  pre-insert agent_run failed for run_id=%s", run_id)
@@ -1078,6 +1107,7 @@ class Agent:
         try:
             from agent_system.api.app import get_run_store
             store = get_run_store()
+            run_status, error_message = _persist_status_fields(result)
             ok_run = await store.save_run(
                 run_id=result.run_id,
                 agent_name=result.agent_name,
@@ -1087,6 +1117,8 @@ class Agent:
                 reflection_count=result.reflection_count,
                 minio_artifacts=result.stored_artifacts,
                 run_trace=run_trace,
+                run_status=run_status,
+                error_message=error_message,
             )
             if not ok_run:
                 logger.error(

@@ -43,6 +43,21 @@ class AgentConfigStore:
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to save agent config '%s': %s", name, exc)
 
+    async def load(self, name: str) -> dict[str, Any] | None:
+        """Return one persisted agent config dict, or None if not found."""
+        try:
+            async with self._pool().acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT config FROM agent_configs WHERE name = $1",
+                    name,
+                )
+            if row is None:
+                return None
+            return json.loads(row["config"])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to load agent config '%s': %s", name, exc)
+            return None
+
     async def load_all(self) -> list[dict[str, Any]]:
         """Return all persisted agent configs as dicts."""
         try:

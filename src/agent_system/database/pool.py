@@ -32,8 +32,8 @@ _pool: Any = None  # asyncpg.Pool
 
 async def init_pool(
     dsn: str,
-    min_size: int = 2,
-    max_size: int = 10,
+    min_size: int | None = None,
+    max_size: int | None = None,
 ) -> None:
     """Create the asyncpg connection pool.
 
@@ -45,6 +45,13 @@ async def init_pool(
     if _pool is not None:
         logger.debug("DB pool already initialised — skipping.")
         return
+
+    if min_size is None or max_size is None:
+        from agent_system.config import get_settings
+
+        cfg = get_settings()
+        min_size = cfg.db_pool_min if min_size is None else min_size
+        max_size = cfg.db_pool_max if max_size is None else max_size
 
     import asyncpg
 

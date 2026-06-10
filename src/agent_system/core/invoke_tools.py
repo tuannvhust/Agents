@@ -46,12 +46,21 @@ def make_invoke_agent_tools(agents: dict[str, "Agent"]) -> list[StructuredTool]:
             _agent: Agent = agent,
             _name: str = agent_name,
         ) -> str:
+            from agent_system.core.run_context import get_run_context
+
+            ctx = get_run_context()
+            forwarded_image_url: str | None = None
+            if _agent.config.enable_ocr and ctx and ctx.image_url:
+                forwarded_image_url = ctx.image_url
+
             logger.info(
-                "[INVOKE AGENT] coordinator delegating to '%s' | task: %.200s",
-                _name, task,
+                "[INVOKE AGENT] coordinator delegating to '%s' | task: %.200s%s",
+                _name,
+                task,
+                f" | image_url={forwarded_image_url!r}" if forwarded_image_url else "",
             )
             try:
-                result = await _agent.run(task)
+                result = await _agent.run(task, image_url=forwarded_image_url)
                 if result.run_status == "awaiting_approval":
                     return (
                         f"Sub-agent '{_name}' paused — awaiting human approval. "

@@ -16,6 +16,7 @@ volumes:
   langfuse-redis-data:
   agent-postgres-data:        # dedicated volume for the agent database
   agent-redis-cache-data:     # optional Redis for API repository cache (CACHE_ENABLED=true)
+  rabbitmq-data:              # RabbitMQ message broker for agent job queue
 
 services:
   # ── Agent System API ──────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ services:
         ]
       # Repository cache (see .env CACHE_*). URL uses Docker service name when cache is enabled.
       CACHE_REDIS_URL: redis://agent-redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-agent}:${RABBITMQ_PASSWORD:-agent}@rabbitmq:5672/
     depends_on:
       minio:
         condition: service_healthy
@@ -64,7 +66,9 @@ services:
         condition: service_healthy
       agent-postgres:
         condition: service_healthy
-      # Required when CACHE_ENABLED=true: same compose network as CACHE_REDIS_URL=redis://agent-redis:6379/0
+      rabbitmq:
+        condition: service_healthy
+      # Redis: optional read cache + HITL pending approvals when QUEUE_ENABLED=true
       agent-redis:
         condition: service_healthy
       langfuse-web:
@@ -76,6 +80,55 @@ services:
       - ./guardrails:/app/guardrails:ro
       # Drop PDFs here on the host; inside the container use paths like /ocr_input/your.pdf
       # for ocr_document (host paths such as /Users/... are NOT visible in the container).
+      - ./ocr_input:/ocr_input:ro
+
+  # ── Agent run workers (RabbitMQ) ────────────────────────────────────────
+  # Scale: docker compose up --scale worker=3
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    command: ["agent-worker"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      LANGFUSE_HOST: http://langfuse-web
+      LANGFUSE_PORT: 3000
+      AGENT_POSTGRES_URL: postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agentdb}
+      CACHE_REDIS_URL: redis://agent-redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-agent}:${RABBITMQ_PASSWORD:-agent}@rabbitmq:5672/
+      MCP_SERVERS: >-
+        [
+          {
+            "name": "postgres",
+            "command": "npx",
+            "args": [
+              "--yes",
+              "@modelcontextprotocol/server-postgres",
+              "postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agentdb}"
+            ]
+          }
+        ]
+    depends_on:
+      agent-postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      agent-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - agent-net
+    volumes:
+      - ./skills:/app/skills:ro
+      - ./guardrails:/app/guardrails:ro
       - ./ocr_input:/ocr_input:ro
 
   # ── Agent PostgreSQL ───────────────────────────────────────────────────────
@@ -93,7 +146,7 @@ services:
       - "${AGENT_POSTGRES_PORT:-5433}:5432"   # 5433 on host → 5432 inside container
     volumes:
       - agent-postgres-data:/var/lib/postgresql/data
-      - ./init-db:/docker-entrypoint-initdb.d:ro   # optional init SQL scripts
+      - ./init-db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${AGENT_POSTGRES_USER:-agent} -d ${AGENT_POSTGRES_DB:-agentdb}"]
       interval: 10s
@@ -181,7 +234,29 @@ services:
       - ./src/agent_system/chat/.chainlit:/app/.chainlit
 
   # ── Redis (optional API repository cache) ──────────────────────────────────
-  # Langfuse uses its own Redis (langfuse-redis). This instance is for CACHE_ENABLED=true only.
+  # ── RabbitMQ (agent job queue) ────────────────────────────────────────────
+  # Management UI: http://localhost:15672 (agent / agent)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: agent-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-agent}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-agent}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-net
+
+  # Langfuse uses its own Redis (langfuse-redis). This instance is for cache + HITL state.
   agent-redis:
     image: redis:7-alpine
     container_name: agent-cache-redis
@@ -350,6 +425,23 @@ services:
       langfuse-redis:
         condition: service_healthy
       minio:
+        condition: service_healthy
+    networks:
+      - agent-net
+
+  # ── Redis Commander — Cache / HITL state UI ───────────────────────────────
+  # Web UI to inspect cache keys and HITL pending-approval entries.
+  # Access at http://localhost:8090
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: agent-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: "cache:agent-redis:6379:0"
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8090}:8081"
+    depends_on:
+      agent-redis:
         condition: service_healthy
     networks:
       - agent-net

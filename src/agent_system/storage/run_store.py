@@ -36,6 +36,10 @@ class RunStore:
         reflection_count: int,
         minio_artifacts: list[str] | None = None,
         run_trace: dict[str, Any] | None = None,
+        run_status: str = "completed",
+        error_message: str | None = None,
+        job_id: str | None = None,
+        input_file: str | None = None,
     ) -> bool:
         """Insert or update a row in agent_runs. Returns False on failure."""
         try:
@@ -48,20 +52,29 @@ class RunStore:
                 await conn.execute(
                     """
                     INSERT INTO agent_runs
-                        (run_id, agent_name, task, final_answer, success, reflection_count, minio_artifacts, run_trace)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                        (run_id, agent_name, task, final_answer, success, reflection_count,
+                         minio_artifacts, run_trace, run_status, error_message, job_id, input_file)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12)
                     ON CONFLICT (run_id) DO UPDATE
                         SET final_answer     = EXCLUDED.final_answer,
                             success          = EXCLUDED.success,
                             reflection_count = EXCLUDED.reflection_count,
                             minio_artifacts  = EXCLUDED.minio_artifacts,
                             run_trace        = EXCLUDED.run_trace,
+                            run_status       = EXCLUDED.run_status,
+                            error_message    = EXCLUDED.error_message,
+                            job_id           = COALESCE(EXCLUDED.job_id, agent_runs.job_id),
+                            input_file       = COALESCE(EXCLUDED.input_file, agent_runs.input_file),
                             updated_at       = NOW()
                     """,
                     run_id, agent_name, task, final_answer, success,
                     reflection_count,
                     json.dumps(minio_artifacts or []),
                     trace_payload,
+                    run_status,
+                    error_message,
+                    job_id,
+                    input_file,
                 )
             logger.debug(
                 "RunStore: saved agent_run run_id=%s artifacts=%s",
@@ -72,6 +85,120 @@ class RunStore:
             logger.error("RunStore: failed to save run %s: %s", run_id, exc)
             return False
 
+    async def ensure_run_row(
+        self,
+        run_id: str,
+        agent_name: str,
+        task: str,
+        run_status: str = "running",
+    ) -> bool:
+        """Insert a run row only when absent (worker pre-run guard)."""
+        try:
+            async with self._pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_runs
+                        (run_id, agent_name, task, final_answer, success, reflection_count,
+                         minio_artifacts, run_trace, run_status)
+                    VALUES ($1, $2, $3, '', FALSE, 0, '[]'::jsonb, '{}'::jsonb, $4)
+                    ON CONFLICT (run_id) DO NOTHING
+                    """,
+                    run_id,
+                    agent_name,
+                    task,
+                    run_status,
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("RunStore: ensure_run_row failed for %s: %s", run_id, exc)
+            return False
+
+    async def save_queued_run(
+        self,
+        run_id: str,
+        agent_name: str,
+        task: str,
+        job_id: str | None = None,
+        input_file: str | None = None,
+    ) -> bool:
+        """Insert a placeholder row while a run waits in the job queue."""
+        return await self.save_run(
+            run_id=run_id,
+            agent_name=agent_name,
+            task=task,
+            final_answer="",
+            success=False,
+            reflection_count=0,
+            minio_artifacts=[],
+            run_status="queued",
+            job_id=job_id,
+            input_file=input_file,
+        )
+
+    async def update_run_status(
+        self,
+        run_id: str,
+        run_status: str,
+        error_message: str | None = None,
+    ) -> bool:
+        """Update lifecycle status without overwriting run results."""
+        try:
+            async with self._pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE agent_runs
+                       SET run_status = $2,
+                           error_message = COALESCE($3, error_message),
+                           updated_at = NOW()
+                     WHERE run_id = $1
+                    """,
+                    run_id,
+                    run_status,
+                    error_message,
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("RunStore: failed to update status for %s: %s", run_id, exc)
+            return False
+
+    async def update_job_id(self, run_id: str, job_id: str) -> bool:
+        """Set RabbitMQ job id after enqueue (row must already exist)."""
+        try:
+            async with self._pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE agent_runs
+                       SET job_id = $2,
+                           updated_at = NOW()
+                     WHERE run_id = $1
+                    """,
+                    run_id,
+                    job_id,
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("RunStore: failed to update job_id for %s: %s", run_id, exc)
+            return False
+
+    async def update_input_file(self, run_id: str, input_file: str) -> bool:
+        """Persist the MinIO path of the original input file for a run."""
+        try:
+            async with self._pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE agent_runs
+                       SET input_file = $2,
+                           updated_at = NOW()
+                     WHERE run_id = $1
+                    """,
+                    run_id,
+                    input_file,
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("RunStore: failed to update input_file for %s: %s", run_id, exc)
+            return False
+
     async def fetch_run(self, run_id: str) -> dict[str, Any] | None:
         """Load one agent_runs row by ``run_id`` (conversation / run metadata)."""
         try:
@@ -79,7 +206,8 @@ class RunStore:
                 row = await conn.fetchrow(
                     """
                     SELECT run_id, agent_name, task, final_answer, success, reflection_count,
-                           minio_artifacts, run_trace, created_at, updated_at
+                           minio_artifacts, run_trace, run_status, error_message,
+                           job_id, input_file, created_at, updated_at
                     FROM agent_runs
                     WHERE run_id = $1
                     """,

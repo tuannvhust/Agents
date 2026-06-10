@@ -97,53 +97,57 @@ class AgentConfigRequest(BaseModel):
         return [n for n in (v or []) if n != "string"]
 
 
-class AgentRunRequest(BaseModel):
-    """Payload for triggering an agent run."""
-
-    task: str = Field(..., description="The task / instruction for the agent", min_length=1)
-    session_id: str | None = Field(
-        None,
-        description="Optional session/run ID for traceability. Auto-generated if omitted.",
-    )
-    include_trace: bool = Field(
-        False,
-        description="If true, include the full structured run trace in the response (can be large).",
-    )
-    image_url: str | None = Field(
-        None,
-        description=(
-            "Optional image URL.  When provided and the agent has enable_ocr=True, "
-            "the vision LLM node processes the image before the main agent loop."
-        ),
-        examples=["https://example.com/invoice.png"],
-    )
+RunStatusLiteral = Literal[
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "awaiting_approval",
+]
 
 
-class AgentRunResponse(BaseModel):
-    """Response returned after an agent completes a run."""
+class RunAcceptedResponse(BaseModel):
+    """Returned immediately when a run is enqueued (HTTP 202)."""
 
     agent_name: str
     run_id: str
     task: str
-    final_answer: str
-    success: bool
-    reflection_count: int
-    messages_count: int
+    run_status: Literal["queued"] = "queued"
+    job_id: str | None = None
+    poll_url: str = Field(
+        ...,
+        description="Poll this path until run_status is completed, failed, or awaiting_approval.",
+    )
+
+
+class RunStatusResponse(BaseModel):
+    """Poll result for an async agent run."""
+
+    agent_name: str
+    run_id: str
+    task: str
+    run_status: RunStatusLiteral
+    job_id: str | None = None
+    input_file: str | None = Field(
+        None,
+        description=(
+            "MinIO object path of the original input file (image/PDF), if one was provided. "
+            "Format: runs/{agent_name}/{run_id}/inputs/{filename}"
+        ),
+    )
+    final_answer: str = ""
+    success: bool = False
+    reflection_count: int = 0
+    messages_count: int = 0
     stored_artifacts: list[str] = Field(default_factory=list)
     error: str | None = None
-    run_status: Literal["completed", "awaiting_approval"] = Field(
-        "completed",
-        description="awaiting_approval when the run stopped for human tool approval.",
-    )
     approval_request: dict[str, Any] | None = Field(
         None,
-        description="Payload for the Reviewer UI (planned tools, args, message digest). "
-        "Set when run_status is awaiting_approval.",
+        description="Set when run_status is awaiting_approval.",
     )
     trace: dict[str, Any] | None = Field(
         None,
-        description="Structured trace (plan text, tool choices, exact args, reflection). "
-        "Present when include_trace was true on the request.",
+        description="Present when include_trace=true and the run has finished.",
     )
 
 

@@ -151,6 +151,18 @@ class Settings(BaseSettings):
     cache_conversation_ttl_seconds: int = Field(120, alias="CACHE_CONVERSATION_TTL_SECONDS")
     cache_tool_messages_ttl_seconds: int = Field(120, alias="CACHE_TOOL_MESSAGES_TTL_SECONDS")
 
+    # Async job queue — POST /run (multipart) enqueues work; agent-worker processes jobs via RabbitMQ.
+    queue_enabled: bool = Field(True, alias="QUEUE_ENABLED")
+    rabbitmq_url: str = Field(
+        "amqp://agent:agent@localhost:5672/",
+        alias="RABBITMQ_URL",
+    )
+    queue_max_jobs: int = Field(10, alias="QUEUE_MAX_JOBS")
+    queue_job_timeout: int = Field(3600, alias="QUEUE_JOB_TIMEOUT")
+    # DB pool sizing (per API / worker process)
+    db_pool_min: int = Field(2, alias="DB_POOL_MIN")
+    db_pool_max: int = Field(20, alias="DB_POOL_MAX")
+
     # Multi-agent orchestration: role-specific model overrides.
     # Coordinator agents default to ORCHESTRATOR_MODEL; sub-agents default to SUBAGENT_MODEL.
     # Both fall back to OPENROUTER_DEFAULT_MODEL when the role-specific var is unset.

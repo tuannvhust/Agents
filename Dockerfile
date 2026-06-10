@@ -54,10 +54,11 @@ WORKDIR /app
 # Copy installed Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy source, skills, and guardrails (SafetyPlugin local rules)
+# Copy source, skills, guardrails, and DB schema (bootstrap reads init-db/)
 COPY src/ src/
 COPY prompts/ prompts/
 COPY guardrails/ guardrails/
+COPY init-db/ init-db/
 
 RUN chown -R appuser:appuser /app
 

@@ -183,10 +183,15 @@ def make_tools_node(tools: list[BaseTool]):
 
         from agent_system.core.run_context import RunContext, run_ctx
 
+        image_url_resolved = state.get("image_url") or None
         ctx_token = None
         if run_id_resolved and agent_name_resolved:
             ctx_token = run_ctx.set(
-                RunContext(run_id=run_id_resolved, agent_name=agent_name_resolved)
+                RunContext(
+                    run_id=run_id_resolved,
+                    agent_name=agent_name_resolved,
+                    image_url=image_url_resolved,
+                )
             )
 
         n_calls = len(last_message.tool_calls)
@@ -450,6 +455,53 @@ def route_after_reflection(state: AgentState) -> Literal["agent", "__end__"]:
 
 # ── Image resolution helper ───────────────────────────────────────────────────
 
+def bytes_to_image_data_url(data: bytes, filename: str) -> str:
+    """Convert raw file bytes (PDF, JPEG, PNG …) to a ``data:image/jpeg;base64,…`` URL.
+
+    Intended for API upload endpoints where the client sends the file content
+    directly so the worker does not need access to the client's filesystem.
+
+    - PDF  → page 1 rendered at 200 DPI → JPEG base64
+    - Other → opened with Pillow → JPEG base64
+    """
+    import io as _io
+
+    _, ext = os.path.splitext(filename.lower())
+
+    if ext == ".pdf":
+        try:
+            from pdf2image import convert_from_bytes  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "pdf2image is required to process PDF files. "
+                "Install it: pip install pdf2image"
+            ) from exc
+        pages = convert_from_bytes(data, dpi=200, first_page=1, last_page=1)
+        if not pages:
+            raise ValueError("[OCR] Could not render any pages from uploaded PDF.")
+        img = pages[0]
+        logger.info("[OCR] rendered uploaded PDF page 1 at 200 DPI (%dx%d)", img.width, img.height)
+    else:
+        try:
+            from PIL import Image as _Image  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "Pillow is required to process image files. Install it: pip install Pillow"
+            ) from exc
+        img = _Image.open(_io.BytesIO(data))
+        img.load()
+        logger.info("[OCR] opened uploaded image %s (%dx%d, mode=%s)", ext, img.width, img.height, img.mode)
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    logger.info("[OCR] encoded uploaded image to base64 JPEG (%d bytes)", buf.tell())
+    return f"data:image/jpeg;base64,{b64}"
+
+
 def _resolve_image_to_data_url(image_input: str) -> str:
     """Normalise *image_input* to a value the vision LLM API will accept.
 
@@ -510,6 +562,52 @@ def _resolve_image_to_data_url(image_input: str) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+async def _upload_local_input_to_minio(loop: asyncio.AbstractEventLoop, file_path: str) -> None:
+    """Upload a local OCR input file to MinIO and persist the object path in the run row.
+
+    Runs in a thread executor so blocking I/O does not block the event loop.
+    Failures are logged but never raise — the OCR result is still returned.
+    """
+    try:
+        from agent_system.core.run_context import get_run_context
+        from agent_system.storage.minio_client import MinIOClient
+
+        ctx = get_run_context()
+        if not (ctx and ctx.run_id and ctx.agent_name):
+            logger.warning("[OCR NODE] no RunContext — skipping MinIO upload for %s", file_path)
+            return
+
+        run_id = ctx.run_id
+        agent_name = ctx.agent_name
+        filename = os.path.basename(file_path)
+
+        def _sync_upload() -> str:
+            with open(file_path, "rb") as fh:
+                data = fh.read()
+            minio = MinIOClient()
+            return minio.upload_input_file(
+                agent_name=agent_name,
+                run_id=run_id,
+                filename=filename,
+                data=data,
+            )
+
+        object_path: str = await loop.run_in_executor(None, _sync_upload)
+        logger.info("[OCR NODE] input file uploaded to MinIO: %s", object_path)
+
+        # Persist the MinIO path in the run row (non-fatal if it fails)
+        try:
+            from agent_system.api.app import get_run_store  # works in worker too
+            store = get_run_store()
+            await store.update_input_file(run_id, object_path)
+            logger.info("[OCR NODE] input_file persisted in agent_runs for run %s", run_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[OCR NODE] could not persist input_file in DB: %s", exc)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[OCR NODE] could not upload input file to MinIO: %s", exc)
+
+
 # ── OCR pre-processing node ───────────────────────────────────────────────────
 
 def make_ocr_node(vlm: BaseChatModel, ocr_skill_name: str):
@@ -545,6 +643,10 @@ def make_ocr_node(vlm: BaseChatModel, ocr_skill_name: str):
             logger.info("[OCR NODE] image resolved to base64 data URL (%d chars)", len(resolved_url))
         else:
             logger.info("[OCR NODE] image is remote URL, using as-is")
+
+        # Upload the original local file to MinIO for auditing / replay
+        if not image_url.startswith(("http://", "https://", "data:")):
+            await _upload_local_input_to_minio(loop, image_url)
 
         skill = _loader.load(ocr_skill_name)
         messages: list[BaseMessage] = [

@@ -21,8 +21,16 @@ async def init_redis(url: str) -> None:
     import redis.asyncio as redis
 
     _client = redis.from_url(url, decode_responses=True, socket_connect_timeout=5)
-    await _client.ping()
-    logger.info("Redis cache connected (%s)", _mask_url(url))
+    try:
+        await _client.ping()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Redis connection failed ({_mask_url(url)}). "
+            "For local dev use agent-redis on port 6380: "
+            "CACHE_REDIS_URL=redis://localhost:6380/0 "
+            "(port 6379 is often Langfuse redis and requires a password)."
+        ) from exc
+    logger.info("Redis connected (%s)", _mask_url(url))
 
 
 async def close_redis() -> None:

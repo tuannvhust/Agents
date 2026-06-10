@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
 from agent_system.api.security import require_api_key
 from agent_system.api.schemas import (
     AgentConfigRequest,
     AgentListResponse,
     AgentResumeRequest,
-    AgentRunRequest,
-    AgentRunResponse,
     AgentSummary,
+    RunAcceptedResponse,
 )
 from agent_system.core.interrupt_registry import get_pending
 from agent_system.core.agent import Agent, AgentConfig
@@ -137,52 +137,142 @@ async def delete_agent(
 
 @router.post(
     "/{name}/run",
-    response_model=AgentRunResponse,
-    summary="Run an agent on a task",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=RunAcceptedResponse,
+    summary="Enqueue an agent run (multipart/form-data)",
 )
-async def run_agent(
+async def enqueue_agent_run_route(
     name: str,
-    payload: AgentRunRequest,
     cache: Annotated[dict[str, Agent], Depends(get_cache)],
-) -> AgentRunResponse:
-    """Trigger a synchronous agent run and return the final answer."""
-    agent = _get_or_404(name, cache)
-    result = await agent.run(
-        task=payload.task,
-        session_id=payload.session_id,
-        image_url=payload.image_url,
-    )
+    task: Annotated[str, Form(description="The task / instruction for the agent")],
+    session_id: Annotated[str | None, Form()] = None,
+    include_trace: Annotated[bool, Form()] = False,
+    image_url: Annotated[
+        str | None,
+        Form(description="Remote image URL for OCR agents. Ignored when a file is uploaded."),
+    ] = None,
+    image: Annotated[
+        UploadFile | None,
+        File(description="Image or PDF for OCR agents. Converted to base64 JPEG by the API."),
+    ] = None,
+) -> RunAcceptedResponse:
+    """Enqueue a run and return immediately (``multipart/form-data``).
 
-    return AgentRunResponse(
-        agent_name=result.agent_name,
-        run_id=result.run_id,
-        task=result.task,
-        final_answer=result.final_answer,
-        success=result.success,
-        reflection_count=result.reflection_count,
-        messages_count=result.messages_count,
-        stored_artifacts=result.stored_artifacts,
-        error=result.error,
-        run_status=result.run_status,
-        approval_request=result.approval_request,
-        trace=result.trace if payload.include_trace else None,
+    - Text-only agents: send ``task`` only.
+    - OCR with a local file: send ``task`` + ``image`` file.
+    - OCR with a remote URL: send ``task`` + ``image_url``.
+
+    Poll ``GET /agents/{name}/runs/{run_id}`` for the result.
+    """
+    _get_or_404(name, cache)
+    from agent_system.api.app import get_run_store
+    from agent_system.config import get_settings
+    from agent_system.queue import enqueue_agent_run
+
+    cfg = get_settings()
+    if not cfg.queue_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Job queue is disabled (QUEUE_ENABLED=false).",
+        )
+
+    resolved_image_url: str | None = image_url.strip() if image_url else None
+    input_file: str | None = None
+    run_id = session_id or str(uuid.uuid4())
+
+    if image is not None and image.filename:
+        agent = cache[name]
+        if not agent.config.enable_ocr:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Agent '{name}' does not have enable_ocr=True — image upload is not supported.",
+            )
+        from agent_system.core.graph import bytes_to_image_data_url
+        from agent_system.storage.minio_client import MinIOClient
+        content = await image.read()
+        try:
+            resolved_image_url = bytes_to_image_data_url(content, image.filename)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Failed to process uploaded image: {exc}",
+            ) from exc
+        logger.info(
+            "enqueue run: converted '%s' (%d bytes) → data URL (%d chars)",
+            image.filename, len(content), len(resolved_image_url),
+        )
+        # Store the original file in MinIO for auditing / replay
+        try:
+            minio = MinIOClient()
+            content_type = image.content_type or "application/octet-stream"
+            input_file = minio.upload_input_file(
+                agent_name=name,
+                run_id=run_id,
+                filename=image.filename,
+                data=content,
+                content_type=content_type,
+            )
+            logger.info("enqueue run: input file stored at %s", input_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("enqueue run: could not upload input file to MinIO: %s", exc)
+
+    store = get_run_store()
+    ok = await store.save_queued_run(
+        run_id=run_id,
+        agent_name=name,
+        task=task,
+        input_file=input_file,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist queued run.",
+        )
+
+    job_id = await enqueue_agent_run(
+        agent_name=name,
+        run_id=run_id,
+        task=task,
+        image_url=resolved_image_url,
+        include_trace=include_trace,
+    )
+    await store.update_job_id(run_id, job_id)
+
+    return RunAcceptedResponse(
+        agent_name=name,
+        run_id=run_id,
+        task=task,
+        job_id=job_id,
+        poll_url=f"/agents/{name}/runs/{run_id}",
     )
 
 
 @router.post(
     "/{name}/runs/{run_id}/resume",
-    response_model=AgentRunResponse,
-    summary="Resume a run paused for human tool approval",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=RunAcceptedResponse,
+    summary="Enqueue resume for a run paused for human tool approval",
 )
 async def resume_agent_run(
     name: str,
     run_id: str,
     payload: AgentResumeRequest,
     cache: Annotated[dict[str, Agent], Depends(get_cache)],
-) -> AgentRunResponse:
-    """Continue execution after the operator approves or rejects the planned tool batch."""
-    agent = _get_or_404(name, cache)
-    pending = get_pending(run_id)
+) -> RunAcceptedResponse:
+    """Enqueue operator decision; poll GET /agents/{name}/runs/{run_id} for the outcome."""
+    _get_or_404(name, cache)
+    from agent_system.api.app import get_run_store
+    from agent_system.config import get_settings
+    from agent_system.queue import enqueue_agent_resume
+
+    cfg = get_settings()
+    if not cfg.queue_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Job queue is disabled (QUEUE_ENABLED=false).",
+        )
+
+    pending = await get_pending(run_id)
     if pending is None or pending.agent_name != name:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -193,32 +283,30 @@ async def resume_agent_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Provide a non-empty 'reason' when action is 'reject'.",
         )
+
     decision: dict = (
         {"action": "approve"}
         if payload.action == "approve"
         else {"action": "reject", "reason": (payload.reason or "").strip()}
     )
-    try:
-        result = await agent.resume_run(run_id=run_id, decision=decision)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
-        ) from exc
 
-    return AgentRunResponse(
-        agent_name=result.agent_name,
-        run_id=result.run_id,
-        task=result.task,
-        final_answer=result.final_answer,
-        success=result.success,
-        reflection_count=result.reflection_count,
-        messages_count=result.messages_count,
-        stored_artifacts=result.stored_artifacts,
-        error=result.error,
-        run_status=result.run_status,
-        approval_request=result.approval_request,
-        trace=None,
+    store = get_run_store()
+    row = await store.fetch_run(run_id)
+    task = (row or {}).get("task") or pending.task
+    await store.update_run_status(run_id, "queued")
+
+    job_id = await enqueue_agent_resume(
+        agent_name=name,
+        run_id=run_id,
+        decision=decision,
+    )
+
+    return RunAcceptedResponse(
+        agent_name=name,
+        run_id=run_id,
+        task=task,
+        job_id=job_id,
+        poll_url=f"/agents/{name}/runs/{run_id}",
     )
 
 

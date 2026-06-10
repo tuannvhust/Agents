@@ -2,24 +2,32 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from agent_system.api.app import create_app
+from agent_system.config.settings import get_settings
 
 
 @pytest.fixture(scope="module")
 def client():
     """TestClient with mocked external services."""
+    os.environ["QUEUE_ENABLED"] = "false"
+    get_settings.cache_clear()
     with (
         patch("agent_system.logging.elastic_logger.ElasticSearchHandler._build_client", return_value=None),
         patch("agent_system.tools.registry.ToolRegistry.load_mcp_tools", new_callable=AsyncMock),
-        patch("agent_system.api.app._init_langfuse"),
+        patch("agent_system.core.checkpointing.init_checkpoint_saver", new_callable=AsyncMock),
+        patch("agent_system.cache.redis_client.init_redis", new_callable=AsyncMock),
+        patch("agent_system.tracing.init_langfuse_handler"),
     ):
         app = create_app()
         with TestClient(app, raise_server_exceptions=False) as c:
             yield c
+    get_settings.cache_clear()
 
 
 def test_health_endpoint(client: TestClient):
